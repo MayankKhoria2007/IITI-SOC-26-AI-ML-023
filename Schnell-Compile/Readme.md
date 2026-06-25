@@ -21,7 +21,7 @@ The objective is to reduce GPU memory consumption while maintaining fast, high-q
 | Precision | FP16 |
 | Transformer Quantization | BitsAndBytes NF4 4-bit + Double Quant |
 | Text Encoder (T5) Quantization | BitsAndBytes NF4 4-bit + Double Quant |
-| GPU | NVIDIA L4 (22.5 GB) |
+| GPU | NVIDIA T4 |
 | Runtime | Lightning AI Studio |
 
 ---
