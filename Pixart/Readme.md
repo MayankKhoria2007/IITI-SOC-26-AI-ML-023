@@ -25,7 +25,7 @@ The objective is to achieve ultra-low VRAM consumption while maintaining high-qu
 | Transformer Quantization | None (FP16) |
 | Text Encoder | Offloaded after prompt encoding |
 | Compiled Components | Transformer + VAE |
-| GPU | NVIDIA L4 (22.5 GB) |
+| GPU | NVIDIA T4 |
 | Runtime | Lightning AI Studio |
 
 ---
@@ -180,7 +180,7 @@ A professional portrait photograph of a young woman with a short asymmetric bob 
 
 ## Key Findings
 
-- Successfully executed PixArt-Sigma-XL-2-1024-MS at 512×512 on a single NVIDIA L4 GPU.
+- Successfully executed PixArt-Sigma-XL-2-1024-MS at 512×512 on a single NVIDIA T4 GPU.
 - Achieved an ultra-low peak VRAM of just **1.8 GB** — the lowest of all benchmarked models — through text encoder offloading combined with VAE tiling and slicing.
 - DPM-Solver++ with Karras sigmas delivers high-quality photorealistic results in as few as 8 steps, making it significantly more efficient than DDPM-based schedulers.
 - Compiling both the transformer and VAE (not just the transformer) provides additional latency reduction compared to transformer-only compilation.
