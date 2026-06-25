@@ -99,7 +99,11 @@ A futuristic city at sunset, cyberpunk style
 Generated image:
 
 ![Output](outputs/output.png)
-
+```
+└── 📁outputs
+    ├── output .png
+    └── ss_output.jpeg
+```
 ---
 
 ## Repository Structure
