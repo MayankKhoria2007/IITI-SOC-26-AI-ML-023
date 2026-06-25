@@ -78,7 +78,7 @@ transformer = FluxTransformer2DModel.from_pretrained(
     subfolder="transformer",
     quantization_config=bnb_transformer,
     torch_dtype=dtype,
-    low_cpu_mem_usage=True,
+    #low_cpu_mem_usage=True,
 )
 
 text_encoder_2 = T5EncoderModel.from_pretrained(
@@ -86,7 +86,7 @@ text_encoder_2 = T5EncoderModel.from_pretrained(
     subfolder="text_encoder_2",
     quantization_config=bnb_text,
     torch_dtype=dtype,
-    low_cpu_mem_usage=True,
+    #low_cpu_mem_usage=True,
 )
 
 pipe = FluxPipeline.from_pretrained(
@@ -107,8 +107,8 @@ print(f"\nModel Load Time: {load_time:.2f}s")
 pipe.transformer = torch.compile(
     pipe.transformer,
     mode="reduce-overhead",
-    fullgraph=False,
 )
+#pipe.vae=torch.compile(pipe.vae,mode="reduce=overhead")
 
 with torch.inference_mode():
     prompt_embeds, pooled_prompt_embeds, _ = pipe.encode_prompt(
