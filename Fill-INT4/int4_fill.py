@@ -129,4 +129,4 @@ print(f"Image successfully processed and saved to: {output_filename}")
 # load time=167 sec
 # compile=5 min 30 sec
 # infernce time=14.54 sec
-# vram=6.66GB
+# vram=15.1GB
