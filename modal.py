@@ -74,7 +74,7 @@ class FluxKontextEngine:
         import cloudinary
         from huggingface_hub import login
 
-        hf_token = os.environ.get("HF_TOKEN", "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")
+        hf_token = os.environ.get("HF_TOKEN", "hf.....")
         login(token=hf_token)
 
         cloudinary.config(
