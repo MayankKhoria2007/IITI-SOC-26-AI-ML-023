@@ -1,5 +1,7 @@
 # FLUX.1 Fill + Redux — Fast Inpainting Pipeline
 
+--12.11 second latency and 14.44 GB VRAM
+
 Inpaints a masked region of a photo (e.g. "replace this bed") using
 **FLUX.1-Fill-dev**, conditioned on a **reference/style image** via
 **FLUX.1-Redux-dev** instead of a plain text prompt. Optimized for L4 GPUs
