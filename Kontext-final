@@ -1,0 +1,548 @@
+import os
+import io
+import warnings
+
+import modal
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+warnings.filterwarnings("ignore")
+
+# -----------------------------------------------------------------------------
+# 1. MODAL CONFIGURATION & ENVIRONMENT
+# -----------------------------------------------------------------------------
+APP_NAME = "flux-kontext-cloudinary-teacache-service"
+WEIGHTS_VOLUME_NAME = "flux-kontext-weights-cache"
+HF_SECRET_NAME = "huggingface-secret"
+
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04",
+        add_python="3.11",
+    )
+    .apt_install("git", "libgl1", "libglib2.0-0")
+    .pip_install(
+        "accelerate",
+        "diffusers",
+        "fastapi[standard]",
+        "huggingface_hub",
+        "numpy",
+        "pillow",
+        "pydantic",
+        "scipy",
+        "sentencepiece",
+        "transformers",
+        "opencv-python-headless",
+        "cloudinary",
+    )
+    # Pin torch to the exact build nunchaku's prebuilt wheel was compiled against
+    .pip_install(
+        "torch==2.10.0",
+        "torchvision",
+        index_url="https://download.pytorch.org/whl/cu128",
+    )
+    # Prebuilt nunchaku wheel — no source compilation, no nvcc needed
+    .pip_install(
+        "https://github.com/nunchaku-tech/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1+cu12.8torch2.10-cp311-cp311-linux_x86_64.whl"
+    )
+)
+
+app = modal.App(APP_NAME, image=image)
+web_app = FastAPI(title="Flux Kontext Cloudinary TeaCache Service")
+
+weights_volume = modal.Volume.from_name(WEIGHTS_VOLUME_NAME, create_if_missing=True)
+CACHE_DIR = "/cache"
+HF_CACHE_DIR = f"{CACHE_DIR}/huggingface"
+TORCH_CACHE_DIR = f"{CACHE_DIR}/torch"
+
+# TeaCache constants
+MAX_CONSECUTIVE_SKIPS = 2
+POLY_COEFFS = [
+    4.98651651e+02,
+   -2.83781631e+02,
+    5.58554382e+01,
+   -3.82021401e+00,
+    2.64230861e-01,
+]
+
+# -----------------------------------------------------------------------------
+# 2. PYDANTIC SCHEMAS
+# -----------------------------------------------------------------------------
+class GenerateRequest(BaseModel):
+    image_url: str
+    prompt: str
+    steps: int = 8
+    guidance: float = 3.5
+    teacache_thresh: float = 0.25
+    height: int = 1024
+    width: int = 1024
+    enhance: bool = True
+
+# --- TeaCache patch ------------------------------------------------------------
+def _poly1d(coeffs, x):
+    """Evaluate a polynomial (highest degree first) at x — no numpy needed."""
+    result = 0.0
+    for c in coeffs:
+        result = result * x + c
+    return result
+
+
+def apply_teacache(pipe, num_steps: int, rel_l1_thresh: float):
+    transformer = getattr(pipe.transformer, "_orig_mod", pipe.transformer)
+
+    transformer.tc_cnt                       = 0
+    transformer.tc_num_steps                 = num_steps
+    transformer.tc_rel_l1_thresh             = rel_l1_thresh
+    transformer.tc_accumulated_rel_l1        = 0.0
+    transformer.tc_previous_modulated_input  = None
+    transformer.tc_previous_residual         = None
+    transformer.tc_skip_count                = 0
+    transformer.tc_consecutive_skips         = 0
+    transformer.tc_enabled                   = True
+    transformer.tc_latent_channels           = None
+
+    original_forward = transformer.forward
+
+    def teacache_forward(
+        hidden_states,
+        encoder_hidden_states=None,
+        pooled_projections=None,
+        timestep=None,
+        img_ids=None,
+        txt_ids=None,
+        guidance=None,
+        joint_attention_kwargs=None,
+        return_dict=True,
+        **kwargs,
+    ):
+        temb = transformer.time_text_embed(timestep, guidance, pooled_projections)
+
+        inp          = transformer.x_embedder(hidden_states)
+        temb_        = temb.clone()
+
+        modulated_inp, _, _, _, _ = transformer.transformer_blocks[0].norm1(
+            inp, emb=temb_
+        )
+
+        cnt       = transformer.tc_cnt
+        num_steps = transformer.tc_num_steps
+
+        if cnt == 0 or cnt == num_steps - 1:
+            should_calc = True
+            transformer.tc_accumulated_rel_l1 = 0.0
+        else:
+            rel_diff = (
+                (modulated_inp - transformer.tc_previous_modulated_input).abs().mean()
+                / transformer.tc_previous_modulated_input.abs().mean()
+            ).cpu().item()
+
+            transformer.tc_accumulated_rel_l1 += float(_poly1d(POLY_COEFFS, rel_diff))
+
+            if (
+                transformer.tc_accumulated_rel_l1 < transformer.tc_rel_l1_thresh
+                and transformer.tc_consecutive_skips < MAX_CONSECUTIVE_SKIPS
+            ):
+                should_calc = False
+            else:
+                should_calc = True
+                transformer.tc_accumulated_rel_l1 = 0.0
+
+        transformer.tc_previous_modulated_input = modulated_inp.clone()
+        transformer.tc_cnt += 1
+
+        if not should_calc:
+            transformer.tc_skip_count += 1
+            transformer.tc_consecutive_skips += 1
+            lc = transformer.tc_latent_channels
+            latent_slice = hidden_states[..., :lc]
+            out = latent_slice + transformer.tc_previous_residual
+            if return_dict:
+                from diffusers.models.modeling_outputs import Transformer2DModelOutput
+                return Transformer2DModelOutput(sample=out)
+            return (out,)
+
+        transformer.tc_consecutive_skips = 0
+        # Snapshot input *before* the forward pass so the residual is computed
+        # against the unmodified input, even if the forward mutates hidden_states.
+        hs_pre = hidden_states.detach().clone()
+
+        output = original_forward(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            pooled_projections=pooled_projections,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            guidance=guidance,
+            joint_attention_kwargs=joint_attention_kwargs,
+            return_dict=return_dict,
+            **kwargs,
+        )
+
+        out_tensor = output.sample if return_dict else output[0]
+        transformer.tc_latent_channels = out_tensor.shape[-1]
+        transformer.tc_previous_residual = (
+            out_tensor.detach() - hs_pre[..., :out_tensor.shape[-1]]
+        )
+
+        return output
+
+    transformer.forward = teacache_forward
+    return original_forward
+
+
+def remove_teacache(pipe, original_forward):
+    transformer = getattr(pipe.transformer, "_orig_mod", pipe.transformer)
+    transformer.forward          = original_forward
+    transformer.tc_enabled       = False
+    transformer.tc_cnt           = 0
+    transformer.tc_skip_count    = 0
+
+
+# ---------------------------------------------------------------------------
+# Resize helpers
+# ---------------------------------------------------------------------------
+GRID = 64          # FLUX requires both dims to be divisible by GRID
+MAX_PIXELS = 2_097_152  # 2 MP hard-cap to avoid OOM on L4 (16 GB)
+
+
+def _snap(value: int, grid: int = GRID) -> int:
+    """Round *value* to the nearest multiple of *grid* (minimum = grid)."""
+    return max(grid, round(value / grid) * grid)
+
+
+def snap_dimensions(target_w: int, target_h: int) -> tuple[int, int]:
+    """
+    Snap (target_w, target_h) to nearest multiples of GRID while keeping the
+    total pixel count under MAX_PIXELS.  Used for the warmup path.
+    """
+    w = _snap(target_w)
+    h = _snap(target_h)
+    # Scale down if over the pixel cap
+    if w * h > MAX_PIXELS:
+        scale = (MAX_PIXELS / (w * h)) ** 0.5
+        w = _snap(int(w * scale))
+        h = _snap(int(h * scale))
+    return w, h
+
+
+def resize_for_flux(img, target_w: int, target_h: int):
+    """
+    Resize *img* so that:
+      1. The **source aspect ratio is preserved** — no squashing.
+      2. Both output dimensions are multiples of GRID.
+      3. Total pixels stay under MAX_PIXELS.
+
+    Strategy:
+      - Compute the target megapixel budget (target_w * target_h).
+      - Scale the source so its total pixel count matches that budget.
+      - Snap both dimensions to the nearest GRID multiple.
+      - If still over the cap, scale uniformly until we fit.
+    """
+    from PIL import Image
+
+    src_w, src_h = img.size
+    aspect = src_w / src_h
+
+    # Target pixel budget (clamped to hard cap)
+    budget = min(target_w * target_h, MAX_PIXELS)
+
+    # Derive dimensions that preserve aspect ratio at the target budget:
+    #    new_h = sqrt(budget / aspect),  new_w = new_h * aspect
+    import math
+    new_h = math.sqrt(budget / aspect)
+    new_w = new_h * aspect
+
+    # Snap to GRID
+    new_w = _snap(int(round(new_w)))
+    new_h = _snap(int(round(new_h)))
+
+    # Final safety clamp: if snapping pushed us over the cap, reduce the
+    # pixel budget proportionally and recalculate both dims together so the
+    # aspect ratio is always preserved (vs. shrinking one axis only).
+    while new_w * new_h > MAX_PIXELS:
+        budget *= 0.95
+        new_h = math.sqrt(budget / aspect)
+        new_w = new_h * aspect
+        new_w = _snap(int(round(new_w)))
+        new_h = _snap(int(round(new_h)))
+
+    if (new_w, new_h) != (src_w, src_h):
+        print(f"[resize] {src_w}x{src_h} → {new_w}x{new_h} "
+              f"(target={target_w}x{target_h}, aspect={aspect:.3f})")
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    return img, new_w, new_h
+
+
+def enhance_output(img):
+    import numpy as np
+    import cv2
+    from PIL import Image
+    arr       = np.array(img)
+    gaussian  = cv2.GaussianBlur(arr, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(arr, 1.8, gaussian, -0.8, 0)
+    lab       = cv2.cvtColor(sharpened, cv2.COLOR_RGB2LAB)
+    l, a, b   = cv2.split(lab)
+    clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l         = clahe.apply(l)
+    enhanced  = cv2.merge([l, a, b])
+    enhanced  = cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(enhanced)
+
+# -----------------------------------------------------------------------------
+# 3. MODAL SERVICE CLASS
+# -----------------------------------------------------------------------------
+@app.cls(
+    gpu="L4",
+    image=image,
+    secrets=[
+        modal.Secret.from_name(HF_SECRET_NAME),
+        modal.Secret.from_name("CLOUDINARY_API_KEY"),
+        modal.Secret.from_name("CLOUDINARY_CLOUD_NAME"),
+        modal.Secret.from_name("CLOUDINARY_API_SECRET"),
+    ],
+    timeout=800,
+    startup_timeout=1800,
+    scaledown_window=100,
+    volumes={CACHE_DIR: weights_volume},
+    # ---------------------------------------------------------------------------
+    # CPU-only memory snapshot: checkpoints container state after all models are
+    # loaded, skipping the multi-minute HuggingFace download on every cold start.
+    # GPU snapshot is intentionally NOT enabled — Nunchaku INT4 CUDA kernels cause
+    # SIGSEGV on restore (same issue as final.py, confirmed 2026-07-20).
+    # CPU-only snapshot restores cleanly in ~12 s.
+    # ---------------------------------------------------------------------------
+    enable_memory_snapshot=True,
+)
+@modal.concurrent(max_inputs=1)
+class FluxKontextEngine:
+
+    # ── Phase 2: post-restore runtime init (runs on every container start) ────
+    @modal.enter(snap=False)
+    def configure_runtime(self):
+        """
+        Runs after the snapshot is restored (or immediately after load on the
+        very first boot).  Keeps live credentials out of the frozen checkpoint
+        so they are always fresh on every container start.
+        """
+        import os
+        import cloudinary
+
+        # Configure Cloudinary with live secrets — never bake API keys into a snapshot
+        cloudinary.config(
+            cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+            api_key=os.environ.get("CLOUDINARY_API_KEY"),
+            api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
+            secure=True,
+        )
+        print("[*] Cloudinary configured (post-snapshot runtime init).")
+
+    # ── Phase 1: snapshotted (runs once, result is checkpointed) ─────────────
+    @modal.enter(snap=True)
+    def load(self):
+        """
+        Runs once during the first container boot.  The resulting in-memory state
+        (downloaded weights, warmed-up pipeline) is captured as a snapshot.  On
+        every subsequent cold start Modal restores from that snapshot, skipping
+        this entire method (~12 s restore vs minutes of downloading).
+        """
+        import os
+        import torch
+        from huggingface_hub import login 
+
+        # Point HF Hub + PyTorch caches to the persistent volume
+        os.environ["HF_HOME"]               = HF_CACHE_DIR
+        os.environ["HUGGINGFACE_HUB_CACHE"] = HF_CACHE_DIR
+        os.environ["TORCH_HOME"]            = TORCH_CACHE_DIR
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        print(f"[*] Weight cache: {HF_CACHE_DIR}")
+
+        # Setup PyTorch optimizations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32       = True
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark         = False
+        torch.backends.cudnn.deterministic     = False
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+
+        # Login to Hugging Face
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+        if token:
+            login(token=token)
+
+        # Load models
+        print("Initializing FLUX.1 Kontext | Nunchaku SVDQuant...")
+        from diffusers import FluxKontextPipeline
+        from nunchaku import NunchakuFluxTransformer2dModel
+        from nunchaku.utils import get_precision
+
+        precision = get_precision()
+        nunchaku_model_id = f"nunchaku-tech/nunchaku-flux.1-kontext-dev/svdq-{precision}_r32-flux.1-kontext-dev.safetensors"
+        
+        print(f"Loading transformer (Nunchaku SVDQuant, {precision}) -> cuda...")
+        transformer = NunchakuFluxTransformer2dModel.from_pretrained(nunchaku_model_id).to("cuda")
+
+        print("Building pipeline...")
+        self.pipe = FluxKontextPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-Kontext-dev",
+            transformer=transformer,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        ).to("cuda")
+
+        self.pipe.text_encoder = self.pipe.text_encoder.to("cuda")
+        self.pipe.vae = self.pipe.vae.to("cuda")
+        self.pipe.vae.use_tiling = False
+        self.pipe.vae.use_slicing = False
+        self.pipe.set_progress_bar_config(disable=True)
+
+        # Commit the weights cache to the persistent volume
+        try:
+            print("[*] Committing weights cache to persistent volume...")
+            weights_volume.commit()
+            print("[+] Volume cache commit completed successfully.")
+        except Exception as e:
+            print(f"[*] Warning: failed to commit weights cache to volume: {e}")
+
+        # Run warmup pass
+        print("Running warmup pass...")
+        from PIL import Image
+        wu_w, wu_h = snap_dimensions(1024, 1024)  # always valid multiples of 64
+        dummy_img = Image.new("RGB", (wu_w, wu_h), color=(128, 128, 128))
+        with torch.inference_mode():
+            pe, ppe, _ = self.pipe.encode_prompt(
+                prompt="warmup prompt",
+                prompt_2=None,
+                device="cuda",
+                num_images_per_prompt=1,
+                max_sequence_length=256,
+            )
+            pe = pe.to("cuda", dtype=torch.bfloat16)
+            ppe = ppe.to("cuda", dtype=torch.bfloat16)
+
+            orig = apply_teacache(self.pipe, 8, 0.25)
+            _ = self.pipe(
+                prompt_embeds=pe,
+                pooled_prompt_embeds=ppe,
+                image=dummy_img,
+                num_inference_steps=8,
+                guidance_scale=3.5,
+                height=wu_h,
+                width=wu_w,
+                max_sequence_length=256,
+            )
+            remove_teacache(self.pipe, orig)
+
+        print("Engine warmed up and fully ready.")
+        print("[*] Snapshot will be taken after this method returns.")
+
+    @modal.method()
+    def generate(self, prompt: str, image_url: str, steps: int, guidance: float, teacache_thresh: float, height: int, width: int, enhance: bool) -> str:
+        import torch
+        import cloudinary.uploader
+        from diffusers.utils import load_image
+
+        from PIL import Image
+        print(f"Loading image from {image_url}...")
+        raw_img = load_image(image_url).convert("RGB")
+
+        # Resize: preserve aspect ratio, snap to mult-of-64, clamp to 2 MP
+        img, actual_w, actual_h = resize_for_flux(raw_img, width, height)
+
+        print(f"Encoding prompt: '{prompt}'...")
+        with torch.inference_mode():
+            pe, ppe, _ = self.pipe.encode_prompt(
+                prompt=prompt,
+                prompt_2=None,
+                device="cuda",
+                num_images_per_prompt=1,
+                max_sequence_length=256,
+            )
+            # Keep .to() inside inference_mode to suppress autograd bookkeeping
+            pe  = pe.to("cuda", dtype=torch.bfloat16)
+            ppe = ppe.to("cuda", dtype=torch.bfloat16)
+
+        # Guard: enable tiling/slicing above 1024×1024 to avoid VAE OOM on L4
+        if actual_h > 1024 or actual_w > 1024:
+            self.pipe.enable_vae_tiling()
+            self.pipe.enable_vae_slicing()
+        else:
+            self.pipe.vae.use_tiling  = False
+            self.pipe.vae.use_slicing = False
+
+        print(f"Rendering {actual_w}x{actual_h} (steps={steps}, thresh={teacache_thresh})...")
+        orig = apply_teacache(self.pipe, steps, teacache_thresh)
+
+        with torch.inference_mode():
+            result = self.pipe(
+                prompt_embeds=pe,
+                pooled_prompt_embeds=ppe,
+                image=img,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                height=actual_h,
+                width=actual_w,
+                max_sequence_length=256,
+            )
+
+        skipped = getattr(self.pipe.transformer, "_orig_mod", self.pipe.transformer).tc_skip_count
+        remove_teacache(self.pipe, orig)
+        print(f"TeaCache skipped {skipped}/{steps} steps.")
+
+        res_img = result.images[0]
+        if enhance:
+            print("Applying enhancement filter...")
+            res_img = enhance_output(res_img)
+
+        # Upload image to Cloudinary
+        print("Uploading result to Cloudinary...")
+        buf = io.BytesIO()
+        res_img.save(buf, format="PNG")
+        buf.seek(0)
+        upload_result = cloudinary.uploader.upload(
+            buf,
+            folder="flux-kontext-outputs",
+            overwrite=True,
+            resource_type="image",
+        )
+        return upload_result["secure_url"]
+
+# -----------------------------------------------------------------------------
+# 4. FASTAPI ASGI APP
+# -----------------------------------------------------------------------------
+
+# Module-level singleton — avoids spinning up a new runner per request,
+# which is the root cause of ClientClosed / shutdown-timeout errors.
+_engine = FluxKontextEngine()
+
+
+@web_app.post("/generate")
+async def generate_endpoint(req: GenerateRequest):
+    try:
+        url = await _engine.generate.remote.aio(
+            prompt=req.prompt,
+            image_url=req.image_url,
+            steps=req.steps,
+            guidance=req.guidance,
+            teacache_thresh=req.teacache_thresh,
+            height=req.height,
+            width=req.width,
+            enhance=req.enhance,
+        )
+        return {"output_url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.function(image=image)
+@modal.asgi_app()
+def fastapi_app():
+    return web_app
+
+
+@app.local_entrypoint()
+def main():
+    print("Run `modal deploy kontext_service.py` to deploy the API.")
