@@ -8,15 +8,6 @@ Interior AI Studio solves this with **virtual try-on for interiors** — upload 
 
 ---
 
-## Table of Contents
-
-- [Core Modules](#core-modules)
-- [Web Application](#web-application)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-
----
-
 ## Core Modules
 
 Interior AI Studio is built around five modules that together cover the full lifecycle of a design idea, from a blank page to a finished, explorable room.
