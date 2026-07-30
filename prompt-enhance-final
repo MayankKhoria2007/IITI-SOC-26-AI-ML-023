@@ -1,0 +1,232 @@
+import os
+import time
+import subprocess
+import modal
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = modal.App("prompt_enhance")
+
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+MINUTES = 60
+model_cache = modal.Volume.from_name("qwen-model-cache", create_if_missing=True)
+
+# Secrets — each of these already exists as its own individual Modal secret.
+hf_secret = modal.Secret.from_name("huggingface-secret")
+cloudinary_api_secret = modal.Secret.from_name("CLOUDINARY_API_SECRET")
+cloudinary_cloud_name = modal.Secret.from_name("CLOUDINARY_CLOUD_NAME")
+cloudinary_api_key = modal.Secret.from_name("CLOUDINARY_API_KEY")
+
+vllm_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "vllm==0.6.3.post1",
+        "transformers==4.46.3",
+        "openai",
+        "httpx",
+        "fastapi[standard]",
+        "hf_transfer",
+        "cloudinary",
+    )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache"})
+    .run_commands(
+        "mkdir -p /usr/local/lib/python3.11/site-packages/pyairports",
+        "touch /usr/local/lib/python3.11/site-packages/pyairports/__init__.py",
+        "printf 'AIRPORT_LIST = []\\n' > /usr/local/lib/python3.11/site-packages/pyairports/airports.py",
+    )
+)
+
+SYSTEM_PROMPT_SCHNELL = """You are an interior design prompt engineer AND content safety filter for a text-to-image app.
+
+Check the user's input:
+- If it contains violence, weapons, explicit content, hate speech, gibberish, or is unrelated to 
+  home decor/rooms/furniture, respond with EXACTLY: UNSAFE
+
+- If it is a valid room/furniture request, rewrite it into a premium diffusion-model prompt and 
+  respond with EXACTLY: SAFE|||<enhanced prompt>
+
+ENHANCEMENT RULES (only if SAFE):
+1. The enhanced prompt MUST start exactly with "Create a room with ".
+2. Elevate requested items with premium textures/materials (plush fabrics, matte-finished wood, 
+   brushed metal accents, clean-lined silhouettes).
+3. Do NOT add unrequested themes (no Art Deco, Bohemian, etc unless asked).
+4. Keep background brief: bright matte white walls, light hardwood floors.
+5. Under 85 words total.
+6. End with: photorealistic, 8k, interior design photography, architectural digest style.
+
+Output ONLY one line — either "UNSAFE" or "SAFE|||<prompt>". Nothing else, no explanation.
+
+Example:
+User: make bed navy blue
+Output: SAFE|||Create a room with a luxury low-profile bed featuring rich navy blue linen bedding, crisp cotton folds, and matching plush navy pillows. Set against a clean matte white wall with light hardwood flooring, soft natural daylight streaming from a window. Photorealistic, 8k, interior design photography, architectural digest style.
+"""
+
+SYSTEM_PROMPT_FILL = """You are an interior design prompt engineer AND content safety filter for an image inpainting app.
+
+The user is replacing a masked object (e.g. a sofa, chair, table) in an existing photo with a new 
+version of that object, shown in a separate reference image. The background/room is NOT being 
+regenerated — only the masked object is.
+
+Check the user's input:
+- If it contains violence, weapons, explicit content, hate speech, gibberish, or is unrelated to 
+  furniture/object replacement, respond with EXACTLY: UNSAFE
+
+- If it is a valid object-replacement request, rewrite it and respond with EXACTLY: SAFE|||<enhanced prompt>
+
+ENHANCEMENT RULES (only if SAFE):
+1. Identify the object being replaced (e.g. "sofa", "chair", "dining table").
+2. If the user gives NO specific details, output exactly in this template for changing the pattern,design and dimension of the object like a sofa or bed :
+   "A new <object> with new design, pattern, legs and dimensions."
+3. If the user DOES specify a detail (e.g. "wooden legs", "striped pattern"), swap only that 
+   matching word into the template, keep the rest generic. Do NOT invent unrequested details.
+4. Do NOT mention room, walls, floor, lighting, or background.
+5. ONE short sentence only. No photography/quality tags at the end.
+6. Output must always start with "A new <object>".
+
+Output ONLY one line — either "UNSAFE" or "SAFE|||<prompt>". Nothing else, no explanation.
+
+Example:
+User: Replace the sofa in the image with new sofa in reference image
+Output: SAFE|||A new sofa with new design, pattern, legs and dimensions.
+
+User: replace the chair, make legs wooden
+Output: SAFE|||A new chair with new design, pattern, wooden legs and dimensions.
+"""
+
+
+MODES = {"schnell": SYSTEM_PROMPT_SCHNELL, "fill": SYSTEM_PROMPT_FILL}
+
+
+class EnhanceRequest(BaseModel):
+    prompt: str
+    mode: str = "schnell"
+
+
+class EnhanceResponse(BaseModel):
+    status: str
+    original: str
+    enhanced: str | None = None
+    mode: str
+    reason: str | None = None
+
+
+@app.function(
+    image=vllm_image,
+    gpu="L4",
+    min_containers=0,
+    scaledown_window=600,
+    timeout=10 * MINUTES,
+    volumes={"/cache": model_cache},
+    secrets=[hf_secret, cloudinary_api_secret, cloudinary_cloud_name, cloudinary_api_key],
+)
+@modal.concurrent(max_inputs=8)
+@modal.asgi_app()
+def serve():
+    import httpx
+    from openai import OpenAI, NotFoundError
+    import cloudinary
+
+    # Hugging Face auth (env var comes from the "huggingface-secret" Modal secret,
+    # e.g. HF_TOKEN or HUGGING_FACE_HUB_TOKEN depending on how you named the key).
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_token:
+        os.environ.setdefault("HF_TOKEN", hf_token)
+
+    # Cloudinary config (env vars come from the CLOUDINARY_* Modal secrets).
+    cloudinary.config(
+        cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
+        api_key=os.environ["CLOUDINARY_API_KEY"],
+        api_secret=os.environ["CLOUDINARY_API_SECRET"],
+    )
+
+    subprocess.Popen(
+        [
+            "python", "-m", "vllm.entrypoints.openai.api_server",
+            "--model", MODEL_NAME,
+            "--host", "127.0.0.1",
+            "--port", "8000",
+            "--quantization", "awq",
+            "--max-model-len", "4096",
+            "--max-num-seqs", "8",
+            "--gpu-memory-utilization", "0.90",
+            "--dtype", "half",
+        ]
+    )
+
+    for _ in range(96):
+        try:
+            r = httpx.get("http://127.0.0.1:8000/health", timeout=2)
+            if r.status_code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(5)
+
+    _client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="EMPTY")
+
+    web_app = FastAPI(title="Prompt Enhancer")
+
+    def process_user_prompt(user_prompt: str, mode: str) -> dict:
+        if mode not in MODES:
+            return {
+                "status": "rejected",
+                "original": user_prompt,
+                "enhanced": None,
+                "mode": mode,
+                "reason": f"Unknown mode '{mode}'. Choose from {list(MODES.keys())}",
+            }
+
+        max_retries, retry_delay = 5, 10
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response = _client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": MODES[mode]},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=130,
+                    temperature=0.3,
+                    stop=["\n"],
+                )
+                break
+            except (NotFoundError, httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+                if attempt == max_retries - 1:
+                    return {
+                        "status": "rejected",
+                        "original": user_prompt,
+                        "enhanced": None,
+                        "mode": mode,
+                        "reason": "model not ready",
+                    }
+                time.sleep(retry_delay)
+            except Exception as e:
+                print(f"Processing failed: {e} — rejecting for safety.")
+                return {
+                    "status": "rejected",
+                    "original": user_prompt,
+                    "enhanced": None,
+                    "mode": mode,
+                    "reason": "processing error",
+                }
+
+        content = (response.choices[0].message.content or "").strip()
+
+        if not content.startswith("SAFE|||"):
+            return {
+                "status": "rejected",
+                "original": user_prompt,
+                "enhanced": None,
+                "mode": mode,
+                "reason": "Prompt does not match use case or violates content guidelines.",
+            }
+
+        enhanced = content.split("SAFE|||", 1)[1].strip()
+        return {"status": "ok", "original": user_prompt, "enhanced": enhanced, "mode": mode, "reason": None}
+
+    @web_app.post("/enhance", response_model=EnhanceResponse)
+    def enhance_endpoint(req: EnhanceRequest):
+        return process_user_prompt(req.prompt, req.mode)
+
+    return web_app
