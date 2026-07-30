@@ -1,0 +1,392 @@
+import os
+import io
+import uuid
+import argparse
+import warnings
+import urllib.request
+
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+from scipy.ndimage import binary_fill_holes, binary_closing
+from scipy.ndimage import label as cc_label
+
+from hydra import initialize_config_dir, compose
+from hydra.core.global_hydra import GlobalHydra
+from hydra.utils import instantiate
+from sam2.build_sam import _load_checkpoint
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+warnings.filterwarnings("ignore")
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+SAM2_CONFIG_DIR = "/teamspace/studios/this_studio/sam2_repo/sam2/configs/sam2.1"
+SAM2_CFG = "sam2.1_hiera_l"
+SAM2_CKPT = "/teamspace/studios/this_studio/sam2_repo/checkpoints/sam2.1_hiera_large.pt"
+
+SESSIONS_ROOT = "sessions"
+
+
+def get_session_dir(session_id, sessions_root=SESSIONS_ROOT):
+    return os.path.join(sessions_root, session_id)
+
+
+def create_session(sessions_root=SESSIONS_ROOT, session_id=None):
+    if not session_id:
+        session_id = uuid.uuid4().hex[:12]
+    session_dir = get_session_dir(session_id, sessions_root)
+    os.makedirs(session_dir, exist_ok=True)
+    return session_id, session_dir
+
+
+def load_image(source):
+    if source.startswith("http://") or source.startswith("https://"):
+        print(f"[*] Downloading image from URL: {source}")
+        req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+    else:
+        print(f"[*] Loading image from local path: {source}")
+        image = Image.open(source).convert("RGB")
+    return image
+
+
+def clamp_point_to_image(point, image):
+    w, h = image.size
+    x, y = point
+    cx = min(max(x, 0), w - 1)
+    cy = min(max(y, 0), h - 1)
+    if (cx, cy) != (x, y):
+        print(f" [WARNING] click point {point} is outside the {w}x{h} image bounds "
+              f"-> clamped to ({cx}, {cy}).")
+    return (cx, cy)
+
+
+def load_sam2_predictor(cfg_name=SAM2_CFG, ckpt_path=SAM2_CKPT):
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=SAM2_CONFIG_DIR, version_base="1.2"):
+        cfg = compose(config_name=cfg_name)
+        model = instantiate(cfg.model, _recursive_=True)
+        _load_checkpoint(model, ckpt_path)
+        model = model.to("cuda").eval()
+    return SAM2ImagePredictor(model), model
+
+
+def unload_sam2(predictor, model):
+    import gc
+    del predictor, model
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print(f" GPU mem after SAM2 unload: "
+          f"{torch.cuda.memory_allocated() / (1024**3):.2f} GB allocated, "
+          f"{torch.cuda.memory_reserved() / (1024**3):.2f} GB reserved")
+
+
+def clean_mask(mask01, close_iterations=8):
+    mask = mask01.astype(bool)
+    mask = binary_closing(mask, iterations=close_iterations)
+    mask = binary_fill_holes(mask)
+
+    labeled, n = cc_label(mask)
+    if n > 1:
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        mask = labeled == sizes.argmax()
+
+    return mask.astype(np.uint8)
+
+
+def generate_mask_candidates(sam2_predictor, point):
+    coords = np.array([list(point)], dtype=np.float32)
+    labels = np.array([1], dtype=np.int32)
+    masks, scores, _ = sam2_predictor.predict(
+        point_coords=coords,
+        point_labels=labels,
+        multimask_output=True,
+    )
+    candidates = [clean_mask(m) for m in masks]
+    return candidates, scores
+
+
+def save_candidate_previews(image, candidates, scores, point, click_index, out_dir="."):
+    paths = []
+    for idx, (mask01, score) in enumerate(zip(candidates, scores)):
+        base = image.convert("RGBA")
+        overlay_layer = Image.new("RGBA", base.size, (173, 216, 230, 0))
+        alpha_mask = Image.fromarray((mask01 * 110).astype(np.uint8))
+        overlay_layer.putalpha(alpha_mask)
+        overlay = Image.alpha_composite(base, overlay_layer).convert("RGB")
+
+        draw = ImageDraw.Draw(overlay)
+        x, y = clamp_point_to_image(point, image)
+        r = 5
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 0, 0), outline=(255, 0, 0))
+
+        path = f"{out_dir}/click{click_index}_candidate{idx}_score{score:.2f}.png"
+        overlay.save(path)
+        paths.append(path)
+        print(f" click {click_index} candidate #{idx}: sam2_score={score:.3f} -> saved {path}")
+    return paths
+
+
+def choose_candidate(candidates, scores, click_index, paths, preselected=None):
+    if preselected is not None:
+        print(f" click {click_index}: using preselected candidate #{preselected}")
+        return candidates[preselected]
+
+    print(f"\n click {click_index}: open these preview images and pick an index —")
+    for idx, (path, score) in enumerate(zip(paths, scores)):
+        print(f"    {idx}: {path}  (sam2_score={score:.3f})")
+
+    while True:
+        choice = input(f" click {click_index}: enter choice (0-{len(candidates)-1}): ").strip()
+        if choice.isdigit() and int(choice) < len(candidates):
+            return candidates[int(choice)]
+        print(" Invalid choice, try again.")
+
+
+def save_masks(image, mask01, click_points, mask_path="mask.png",
+               overlay_path="overlay.png", marker_radius=5):
+    if mask01 is None:
+        print(f" [WARNING] no active clicks left — skipping save of {mask_path} / {overlay_path}")
+        return
+
+    mask_img = Image.fromarray((mask01 * 255).astype(np.uint8)).convert("RGB")
+    mask_img.save(mask_path)
+
+    base = image.convert("RGBA")
+    overlay_layer = Image.new("RGBA", base.size, (173, 216, 230, 0))
+    alpha_mask = Image.fromarray((mask01 * 110).astype(np.uint8))
+    overlay_layer.putalpha(alpha_mask)
+    overlay = Image.alpha_composite(base, overlay_layer).convert("RGB")
+
+    draw = ImageDraw.Draw(overlay)
+    r = marker_radius
+    for (x, y) in click_points:
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 0, 0), outline=(255, 0, 0))
+    overlay.save(overlay_path)
+
+    print(f" saved mask -> {mask_path}")
+    print(f" saved overlay -> {overlay_path}")
+
+
+def recompute_combined(records):
+    active_masks = [r["mask"] for r in records if r["active"]]
+    if not active_masks:
+        return None
+    combined = active_masks[0].copy()
+    for m in active_masks[1:]:
+        combined = np.logical_or(combined, m).astype(np.uint8)
+    return combined
+
+
+def recompute_combined_clean(records):
+    combined = recompute_combined(records)
+    if combined is None:
+        return None
+    return clean_mask(combined)
+
+
+def active_points(records):
+    return [r["point"] for r in records if r["active"]]
+
+
+def apply_removals(records, remove_indices, click_index_label="?"):
+    applied = []
+    for idx in remove_indices:
+        if idx < 0 or idx >= len(records):
+            print(f" [WARNING] (after click {click_index_label}) cannot remove click {idx}: "
+                  f"no such click.")
+            continue
+        if not records[idx]["active"]:
+            print(f" [WARNING] (after click {click_index_label}) click {idx} is already removed.")
+            continue
+        records[idx]["active"] = False
+        applied.append(idx)
+        print(f" [INFO] (after click {click_index_label}) removed click {idx} "
+              f"(point={records[idx]['point']}) from the union.")
+    return applied
+
+
+def prompt_removal_interactive(records, click_index):
+    currently_active = [r["index"] for r in records if r["active"]]
+    if not currently_active:
+        return []
+
+    print(f" Active clicks so far: {currently_active}")
+    raw = input(
+        f" click {click_index}: remove any previous click(s) from the union? "
+        f"Enter comma-separated click indices to remove (e.g. '0' or '0,2'), "
+        f"or press Enter to keep all: "
+    ).strip()
+    if not raw:
+        return []
+
+    to_remove = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if tok.isdigit() and int(tok) in currently_active:
+            to_remove.append(int(tok))
+        else:
+            print(f" [WARNING] ignoring invalid/inactive click index '{tok}'")
+    return to_remove
+
+
+def segment_image_interactive(image_source, preselected_choices=None, max_dim=1024,
+                               sessions_root=SESSIONS_ROOT, session_id=None):
+    session_id, session_dir = create_session(sessions_root, session_id)
+    original_path = os.path.join(session_dir, "original.png")
+    mask_path = os.path.join(session_dir, "mask.png")
+    overlay_path = os.path.join(session_dir, "overlay.png")
+
+    print(f" [SESSION] id = {session_id}  (dir: {session_dir})")
+
+    original_image = load_image(image_source)
+    orig_w, orig_h = original_image.size
+    scale = max_dim / max(orig_w, orig_h)
+    new_w = max(16, (int(round(orig_w * scale)) // 16) * 16)
+    new_h = max(16, (int(round(orig_h * scale)) // 16) * 16)
+    resized_image = original_image.resize((new_w, new_h), Image.LANCZOS)
+    scale_x = new_w / orig_w
+    scale_y = new_h / orig_h
+    print(f" resized image size: {resized_image.size}")
+
+    resized_image.save(original_path)
+    print(f" [SESSION] {session_id}: saved original image -> {original_path}")
+
+    predictor, model = load_sam2_predictor()
+    predictor.set_image(np.array(resized_image))
+
+    records = []
+    combined = None
+    i = 0
+    try:
+        while True:
+            point_str = input(
+                f" click {i}: enter coordinates as 'x,y' in the ORIGINAL image's pixel "
+                f"space (auto-scaled to the resized {resized_image.size[0]}x{resized_image.size[1]} "
+                f"image), type 'clear' to wipe all clicks and reset the mask, "
+                f"or press Enter to stop clicking: "
+            ).strip()
+            if not point_str:
+                break
+
+            if point_str.lower() in ("clear", "reset"):
+                records = []
+                zero_mask = np.zeros(
+                    (resized_image.size[1], resized_image.size[0]), dtype=np.uint8
+                )
+                save_masks(resized_image, zero_mask, [], mask_path=mask_path, overlay_path=overlay_path)
+                combined = None
+                i = 0
+                print(f" [INFO] all clicks cleared — mask reset to empty and saved to "
+                      f"{mask_path} / {overlay_path}. Click numbering restarts at 0.")
+                print()
+                continue
+
+            x_str, y_str = point_str.split(",")
+            raw_x, raw_y = float(x_str.strip()), float(y_str.strip())
+            point = (int(round(raw_x * scale_x)), int(round(raw_y * scale_y)))
+            point = clamp_point_to_image(point, resized_image)
+
+            candidates, scores = generate_mask_candidates(predictor, point)
+            paths = save_candidate_previews(resized_image, candidates, scores, point, i)
+
+            pick = None
+            if preselected_choices is not None and i < len(preselected_choices):
+                pick = preselected_choices[i]
+            chosen_mask = choose_candidate(candidates, scores, i, paths, preselected=pick)
+
+            print(f" click {i} at {point}: chosen mask = "
+                  f"{chosen_mask.sum()} px ({100 * chosen_mask.sum() / chosen_mask.size:.1f}%)")
+
+            records.append({"index": i, "point": point, "mask": chosen_mask, "active": True})
+
+            combined = recompute_combined_clean(records)
+            used_points = active_points(records)
+            save_masks(
+                resized_image, combined, used_points,
+                mask_path=mask_path,
+                overlay_path=overlay_path,
+            )
+            print(f" click {i}: updated running union -> {mask_path} / {overlay_path}")
+
+            to_remove = prompt_removal_interactive(records, i)
+            if to_remove:
+                applied = apply_removals(records, to_remove, click_index_label=i)
+                if applied:
+                    combined = recompute_combined_clean(records)
+                    used_points = active_points(records)
+                    save_masks(
+                        resized_image, combined, used_points,
+                        mask_path=mask_path,
+                        overlay_path=overlay_path,
+                    )
+                    print(f" click {i}: union recomputed after removing {applied} "
+                          f"-> {mask_path} / {overlay_path}")
+
+            print()
+            i += 1
+    finally:
+        unload_sam2(predictor, model)
+
+    if combined is None:
+        raise ValueError("No active click points remain — at least one click is required.")
+
+    used_points = active_points(records)
+    return session_id, session_dir, combined, resized_image, used_points, records
+
+
+def run_inputs():
+    parser = argparse.ArgumentParser(description="SAM2 interactive segmentation service")
+    parser.add_argument("--image", default=None, help="Path or URL of the original image")
+    parser.add_argument("--choices", default=None,
+                         help="Optional comma-separated candidate indices (0/1/2) per click, "
+                              "e.g. '2,0'. If omitted, you'll be prompted to pick for each click.")
+    parser.add_argument("--max-dim", type=int, default=1024)
+    parser.add_argument("--sessions-dir", default=SESSIONS_ROOT,
+                         help="Root directory where session folders are stored.")
+    parser.add_argument("--session-id", default=None,
+                         help="Optional custom session id. If omitted, one is generated.")
+    args, _ = parser.parse_known_args()
+
+    while not args.image:
+        args.image = input("Image path or URL: ").strip()
+
+    preselected_choices = None
+    if args.choices:
+        preselected_choices = [int(c.strip()) for c in args.choices.split(",")]
+
+    return args, preselected_choices
+
+
+if __name__ == "__main__":
+    args, preselected_choices = run_inputs()
+
+    session_id, session_dir, mask, resized_image, used_points, records = segment_image_interactive(
+        image_source=args.image,
+        preselected_choices=preselected_choices,
+        max_dim=args.max_dim,
+        sessions_root=args.sessions_dir,
+        session_id=args.session_id,
+    )
+
+    if mask is None:
+        print("\n[FAILED] No active clicks remained — nothing was saved.")
+    else:
+        active = [r["index"] for r in records if r["active"]]
+        removed = [r["index"] for r in records if not r["active"]]
+        print(f"\n[SUCCESS] session_id -> {session_id}")
+        print(f" session dir   -> {session_dir}")
+        print(f" original      -> {os.path.join(session_dir, 'original.png')}")
+        print(f" mask          -> {os.path.join(session_dir, 'mask.png')}")
+        print(f" overlay       -> {os.path.join(session_dir, 'overlay.png')}")
+        print(f" active clicks in final union: {active}")
+        if removed:
+            print(f" removed clicks (excluded from final union): {removed}")
+        print(f"\n Use --session-id {session_id} in the generation script to reuse this mask.")
