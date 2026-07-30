@@ -1,0 +1,622 @@
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import gc
+import io
+import time
+import argparse
+import warnings
+import urllib.request
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+import pillow_avif
+from scipy.ndimage import binary_dilation, binary_fill_holes, binary_closing
+from scipy.ndimage import label as cc_label
+from huggingface_hub import login
+
+from hydra import initialize_config_dir, compose
+from hydra.core.global_hydra import GlobalHydra
+from hydra.utils import instantiate
+from sam2.build_sam import _load_checkpoint
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+from diffusers import FluxFillPipeline, FluxTransformer2DModel, FluxPriorReduxPipeline, TorchAoConfig
+
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+
+warnings.filterwarnings("ignore")
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+login(token="")
+
+SAM2_CONFIG_DIR = "/teamspace/studios/this_studio/sam2_repo/sam2/configs/sam2.1"
+SAM2_CFG = "sam2.1_hiera_l"
+SAM2_CKPT = "/teamspace/studios/this_studio/sam2_repo/checkpoints/sam2.1_hiera_large.pt"
+FLUX_MODEL = "black-forest-labs/FLUX.1-Fill-dev"
+DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+
+GUIDANCE = 45.0
+SEED = 0
+
+
+def parse_points(raw):
+    points = []
+    for chunk in raw.strip().split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        x_str, y_str = chunk.split(",")
+        points.append((int(round(float(x_str.strip()))), int(round(float(y_str.strip())))))
+    if not points:
+        raise ValueError("No click points parsed — expected format 'x1,y1;x2,y2'")
+    return points
+
+
+def load_image(source):
+    if source.startswith("http://") or source.startswith("https://"):
+        print(f"[*] Downloading image from URL: {source}")
+        req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+    else:
+        print(f"[*] Loading image from local path: {source}")
+        image = Image.open(source).convert("RGB")
+    return image
+
+
+def resize_image_and_points(image, click_points, max_dim=1024, multiple_of=16):
+    orig_w, orig_h = image.size
+    scale = max_dim / max(orig_w, orig_h)
+
+    new_w = int(round(orig_w * scale))
+    new_h = int(round(orig_h * scale))
+    new_w = max(multiple_of, (new_w // multiple_of) * multiple_of)
+    new_h = max(multiple_of, (new_h // multiple_of) * multiple_of)
+    resized = image.resize((new_w, new_h), Image.LANCZOS)
+    scale_x = new_w / orig_w
+    scale_y = new_h / orig_h
+    rescaled_points = [
+        (int(round(x * scale_x)), int(round(y * scale_y))) for (x, y) in click_points
+    ]
+    return resized, rescaled_points, scale_x, scale_y
+
+
+def run_inputs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image")
+    parser.add_argument("--prompt")
+    parser.add_argument("--points")
+    parser.add_argument("--choices", default=None,
+                         help="Optional comma-separated candidate indices (0/1/2) per click, "
+                              "e.g. '2,0' to skip interactive prompts")
+    parser.add_argument("--steps", type=int, default=14)
+    parser.add_argument("--warmup-steps", type=int, default=2)
+    parser.add_argument("--guidance", type=float, default=GUIDANCE)
+    parser.add_argument("--dilate-px", type=int, default=6)
+    parser.add_argument("--max-dim", type=int, default=512)
+    parser.add_argument("--skip-depth", action="store_true",
+                         help="Skip depth map generation for parallax/3D preview")
+    parser.add_argument("--mode", choices=["fill", "drag"], default="fill",
+                         help="'fill' = creative inpaint with --prompt (default). "
+                              "'drag' = extract clicked object as a draggable cutout "
+                              "and fill the hole it leaves, for a drag-and-drop UI.")
+    args, _ = parser.parse_known_args()
+
+    image_source = args.image
+    while not image_source:
+        image_source = input("Image path or URL: ").strip()
+
+    mode = args.mode
+    prompt = args.prompt
+    if mode == "fill":
+        while not prompt:
+            prompt = input("Edit prompt: ").strip()
+    else:
+        prompt = prompt or ""
+
+    points_raw = args.points
+    while not points_raw:
+        points_raw = input("Click points, format 'x1,y1;x2,y2': ").strip()
+    click_points = parse_points(points_raw)
+
+    preselected_choices = None
+    if args.choices:
+        preselected_choices = [int(c.strip()) for c in args.choices.split(",")]
+
+    return {
+        "image_source": image_source,
+        "prompt": prompt,
+        "click_points": click_points,
+        "preselected_choices": preselected_choices,
+        "steps": args.steps,
+        "warmup_steps": args.warmup_steps,
+        "guidance": args.guidance,
+        "dilate_px": args.dilate_px,
+        "max_dim": args.max_dim,
+        "skip_depth": args.skip_depth,
+        "mode": args.mode,
+    }
+
+
+def load_sam2_predictor(cfg_name, ckpt_path):
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=SAM2_CONFIG_DIR, version_base="1.2"):
+        cfg = compose(config_name=cfg_name)
+        model = instantiate(cfg.model, _recursive_=True)
+        _load_checkpoint(model, ckpt_path)
+        model = model.to("cuda").eval()
+    return SAM2ImagePredictor(model), model
+
+
+def clean_mask(mask01, close_iterations=8):
+    mask = mask01.astype(bool)
+    mask = binary_closing(mask, iterations=close_iterations)
+    mask = binary_fill_holes(mask)
+
+    labeled, n = cc_label(mask)
+    if n > 1:
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        mask = labeled == sizes.argmax()
+
+    return mask.astype(np.uint8)
+
+
+def generate_mask_candidates(sam2_predictor, point, prev_logits=None):
+    coords = np.array([list(point)], dtype=np.float32)
+    labels = np.array([1], dtype=np.int32)
+    masks, scores, logits = sam2_predictor.predict(
+        point_coords=coords,
+        point_labels=labels,
+        mask_input=prev_logits[None, ...] if prev_logits is not None else None,
+        multimask_output=True,
+    )
+    candidates = [clean_mask(m) for m in masks]
+    return candidates, scores, logits
+
+
+def save_candidate_previews(image, candidates, scores, point, click_index, out_dir="."):
+    paths = []
+    for idx, (mask01, score) in enumerate(zip(candidates, scores)):
+        base = image.convert("RGBA")
+        overlay_layer = Image.new("RGBA", base.size, (173, 216, 230, 0))
+        alpha_mask = Image.fromarray((mask01 * 110).astype(np.uint8))
+        overlay_layer.putalpha(alpha_mask)
+        overlay = Image.alpha_composite(base, overlay_layer).convert("RGB")
+
+        draw = ImageDraw.Draw(overlay)
+        x, y = point
+        r = 5
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 0, 0), outline=(255, 0, 0))
+
+        path = f"{out_dir}/click{click_index}_candidate{idx}_score{score:.2f}.png"
+        overlay.save(path)
+        paths.append(path)
+        print(f" click {click_index} candidate #{idx}: sam2_score={score:.3f}, "
+              f"-> saved {path}")
+    return paths
+
+
+def choose_candidate(candidates, click_index, paths, preselected=None):
+    if preselected is not None:
+        print(f" click {click_index}: using preselected candidate #{preselected}")
+        return candidates[preselected]
+
+    print(f"\n click {click_index}: open these preview images and pick an index —")
+    for idx, path in enumerate(paths):
+        print(f"    {idx}: {path}")
+
+    while True:
+        choice = input(f" click {click_index}: enter choice (0-{len(candidates)-1}): ").strip()
+        if choice.isdigit() and int(choice) < len(candidates):
+            return candidates[int(choice)]
+        print(" Invalid choice, try again.")
+
+
+def segment_clicked_objects(sam2_predictor, click_points, image, preselected_choices=None):
+    if len(click_points) == 2 and all(isinstance(v, (int, float)) for v in click_points):
+        click_points = [click_points]
+
+    combined = None
+    for i, point in enumerate(click_points):
+        candidates, scores, _ = generate_mask_candidates(sam2_predictor, point)
+        paths = save_candidate_previews(image, candidates, scores, point, i)
+
+        pick = None
+        if preselected_choices is not None and i < len(preselected_choices):
+            pick = preselected_choices[i]
+        chosen_mask = choose_candidate(candidates, i, paths, preselected=pick)
+
+        print(f" click {i} at {point}: FINAL chosen mask = "
+              f"{chosen_mask.sum()} px ({100*chosen_mask.sum()/chosen_mask.size:.1f}%)")
+        combined = chosen_mask if combined is None else np.logical_or(combined, chosen_mask).astype(np.uint8)
+    return combined
+
+
+def save_masks(image, mask01, click_points, mask_path="sam2_mask.png",
+               overlay_path="overlay.png", marker_radius=5):
+    if len(click_points) == 2 and all(isinstance(v, (int, float)) for v in click_points):
+        click_points = [click_points]
+
+    mask_img = Image.fromarray((mask01 * 255).astype(np.uint8)).convert("RGB")
+    mask_img.save(mask_path)
+    base = image.convert("RGBA")
+
+    overlay_layer = Image.new("RGBA", base.size, (173, 216, 230, 0))
+    alpha_mask = Image.fromarray((mask01 * 110).astype(np.uint8))
+    overlay_layer.putalpha(alpha_mask)
+    overlay = Image.alpha_composite(base, overlay_layer).convert("RGB")
+    draw = ImageDraw.Draw(overlay)
+    r = marker_radius
+    for (x, y) in click_points:
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 0, 0), outline=(255, 0, 0))
+    overlay.save(overlay_path)
+    print(f" saved mask -> {mask_path}")
+    print(f" saved overlay -> {overlay_path}")
+
+
+def unload_sam2(predictor, model):
+    del predictor, model
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print(f" GPU mem after SAM2 unload: "
+          f"{torch.cuda.memory_allocated() / (1024**3):.2f} GB allocated, "
+          f"{torch.cuda.memory_reserved() / (1024**3):.2f} GB reserved")
+
+
+def load_flux_pipeline(model_name):
+    from nunchaku import NunchakuFluxTransformer2dModel
+    from nunchaku.utils import get_precision
+
+    transformer_load_start = time.perf_counter()
+    print("[*] Loading transformer via Nunchaku (SVDQuant int4/fp4)...")
+    precision = get_precision()
+
+    from huggingface_hub import hf_hub_download
+    nunchaku_repo = "nunchaku-tech/nunchaku-flux.1-fill-dev"
+    nunchaku_filename = f"svdq-{precision}_r32-flux.1-fill-dev.safetensors"
+    local_transformer_path = hf_hub_download(repo_id=nunchaku_repo, filename=nunchaku_filename)
+
+    transformer = NunchakuFluxTransformer2dModel.from_pretrained(local_transformer_path)
+    transformer_load_time = time.perf_counter() - transformer_load_start
+    print(f"Transformer load time: {transformer_load_time:.2f} seconds")
+
+    pipe_load_start = time.perf_counter()
+    pipe = FluxFillPipeline.from_pretrained(
+        model_name,
+        transformer=transformer,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    pipe_load_time = time.perf_counter() - pipe_load_start
+    print(f"Pipeline load time:    {pipe_load_time:.2f} seconds")
+    print(f"Total model load time: {transformer_load_time + pipe_load_time:.2f} seconds")
+
+    free_gb = torch.cuda.mem_get_info()[0] / (1024 ** 3)
+    print(f" Free GPU memory before placement: {free_gb:.2f} GB")
+
+    pipe.to("cuda")
+
+    pipe.enable_vae_slicing()
+    pipe.enable_vae_tiling()
+
+    print(f"  Loading FLUX.1 Redux prior pipeline → cuda...")
+    t_redux = time.perf_counter()
+    pipe.prior_redux = FluxPriorReduxPipeline.from_pretrained(
+        "black-forest-labs/FLUX.1-Redux-dev",
+        torch_dtype=torch.bfloat16,
+        text_encoder=pipe.text_encoder,
+        text_encoder_2=pipe.text_encoder_2,
+        tokenizer=pipe.tokenizer,
+        tokenizer_2=pipe.tokenizer_2,
+    ).to("cuda")
+
+    print(f"  Redux load time: {time.perf_counter()-t_redux:.1f}s")
+
+    return pipe
+
+
+def encode_prompt_and_free_encoders(pipe, prompt, reference_image):
+    resized = reference_image.resize((1024, 1024), Image.LANCZOS)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        redux_out = pipe.prior_redux(image=resized, prompt=prompt)
+    prompt_embeds = redux_out.prompt_embeds.to("cuda", dtype=torch.bfloat16) * 1.3
+    pooled_prompt_embeds = redux_out.pooled_prompt_embeds.to("cuda", dtype=torch.bfloat16) * 1.2
+    print(f"  [redux] encode time: {time.perf_counter()-t0:.2f}s")
+    gc.collect()
+    torch.cuda.empty_cache()
+    return prompt_embeds, pooled_prompt_embeds
+
+
+def run_flux_fill_with_metrics(pipe, image, mask01, prompt_embeds, pooled_prompt_embeds,
+                                steps=14, warmup_steps=2, guidance=30.0, dilate_px=6, seed=0):
+    if dilate_px > 0:
+        mask01 = binary_dilation(mask01, iterations=dilate_px).astype(np.uint8)
+
+    mask_image = Image.fromarray((mask01 * 255).astype(np.uint8)).convert("L")
+    mask_image.save("debug_mask.png")
+    nonzero = (np.array(mask_image) > 0).sum()
+    total = mask01.size
+    print(f" mask_image mode={mask_image.mode}, size={mask_image.size}, "
+          f"nonzero_pixels={nonzero} ({100 * nonzero / total:.1f}%)")
+
+    width, height = image.size
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    with torch.inference_mode():
+        final_output = pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            image=image,
+            mask_image=mask_image,
+            num_inference_steps=10,
+            guidance_scale=guidance,
+            height=1024,
+            width=1024,
+            generator=generator,
+        ).images[0]
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+
+    latency = end_time - start_time
+    peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+    print("\n" + "=" * 50)
+    print("             INFERENCE COMPLETION METRICS")
+    print("=" * 50)
+    print(f" Steps: {steps}  Guidance: {guidance}")
+    print(f" Image size: {1024}x{1024}")
+    print(f" Total Generation Time: {latency:.2f} seconds")
+    print(f" Peak VRAM Utilized:    {peak_vram:.2f} GB")
+    print("=" * 50)
+
+    a = np.array(image.resize(final_output.size)).astype(np.int16)
+    b = np.array(final_output).astype(np.int16)
+    diff = np.abs(a - b)
+    mbool = mask01.astype(bool)
+    if b.shape[:2] == mbool.shape:
+        print(f" mean pixel diff INSIDE mask:  {diff[mbool].mean():.2f}")
+        print(f" mean pixel diff OUTSIDE mask: {diff[~mbool].mean():.2f}")
+
+    return final_output
+
+
+def unload_flux(pipe):
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def extract_object_cutout(image, mask01, feather_px=3):
+    from scipy.ndimage import distance_transform_edt
+
+    mask = mask01.astype(bool)
+    dist_in = distance_transform_edt(mask)
+    alpha = np.zeros(mask.shape, dtype=np.float32)
+    alpha[mask] = np.clip(dist_in[mask] / max(feather_px, 1), 0, 1)
+
+    rgba = np.dstack([np.array(image), (alpha * 255).astype(np.uint8)])
+    cutout_full = Image.fromarray(rgba, mode="RGBA")
+
+    ys, xs = np.where(mask)
+    y0 = max(int(ys.min()) - feather_px, 0)
+    y1 = min(int(ys.max()) + feather_px, mask.shape[0])
+    x0 = max(int(xs.min()) - feather_px, 0)
+    x1 = min(int(xs.max()) + feather_px, mask.shape[1])
+
+    cutout = cutout_full.crop((x0, y0, x1, y1))
+    centroid = (int(xs.mean()), int(ys.mean()))
+    return cutout, (x0, y0, x1, y1), centroid
+
+
+def load_lama_model():
+    from simple_lama_inpainting import SimpleLama
+    t0 = time.perf_counter()
+    lama = SimpleLama()
+    print(f"[*] LaMa loaded in {time.perf_counter()-t0:.2f}s")
+    return lama
+
+
+def remove_object_from_scene(lama, image, mask01, dilate_px=10):
+    if dilate_px > 0:
+        mask01 = binary_dilation(mask01, iterations=dilate_px).astype(np.uint8)
+
+    mask_image = Image.fromarray((mask01 * 255).astype(np.uint8)).convert("L")
+
+    t0 = time.perf_counter()
+    clean_bg = lama(image, mask_image)
+    latency = time.perf_counter() - t0
+
+    print("\n" + "=" * 50)
+    print("             LAMA REMOVAL METRICS")
+    print("=" * 50)
+    print(f" Input size: {image.size}")
+    print(f" Inference time: {latency:.2f}s")
+    print("=" * 50)
+
+    return clean_bg
+
+
+def unload_lama_model(lama):
+    del lama
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f" GPU mem after LaMa unload: "
+          f"{torch.cuda.memory_allocated() / (1024**3):.2f} GB allocated, "
+          f"{torch.cuda.memory_reserved() / (1024**3):.2f} GB reserved")
+
+
+def save_dragdrop_assets(clean_bg, cutout, bbox, centroid,
+                          bg_path="background_clean.png",
+                          cutout_path="object_cutout.png",
+                          meta_path="object_meta.json"):
+    import json
+
+    clean_bg.save(bg_path)
+    cutout.save(cutout_path)
+
+    meta = {
+        "bbox": {"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+        "centroid": {"x": centroid[0], "y": centroid[1]},
+        "cutout_size": {"width": cutout.width, "height": cutout.height},
+        "background_size": {"width": clean_bg.width, "height": clean_bg.height},
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f" saved clean background -> {bg_path}")
+    print(f" saved object cutout    -> {cutout_path}")
+    print(f" saved placement meta   -> {meta_path}")
+    return meta
+
+
+def load_depth_model(model_name=DEPTH_MODEL):
+    t0 = time.perf_counter()
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModelForDepthEstimation.from_pretrained(
+        model_name, torch_dtype=torch.float16
+    ).to("cuda").eval()
+    print(f"[*] Depth model loaded in {time.perf_counter()-t0:.2f}s")
+    return processor, model
+
+
+def run_depth_estimation(processor, model, image,
+                          depth_path_8bit="depth_preview.png",
+                          depth_path_16bit="depth_raw16.png"):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    inputs = processor(images=image, return_tensors="pt").to("cuda", torch.float16)
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        predicted_depth = outputs.predicted_depth
+
+    prediction = torch.nn.functional.interpolate(
+        predicted_depth.unsqueeze(1).float(),
+        size=(image.height, image.width),
+        mode="bicubic",
+        align_corners=False,
+    ).squeeze()
+
+    torch.cuda.synchronize()
+    latency = time.perf_counter() - t0
+
+    depth_np = prediction.cpu().numpy().astype(np.float32)
+    d_min, d_max = depth_np.min(), depth_np.max()
+    depth_norm = (depth_np - d_min) / max(d_max - d_min, 1e-6)
+
+    depth_8bit = (depth_norm * 255.0).astype(np.uint8)
+    depth_16bit = (depth_norm * 65535.0).astype(np.uint16)
+
+    depth_vis = Image.fromarray(depth_8bit, mode="L")
+    depth_vis.save(depth_path_8bit)
+    Image.fromarray(depth_16bit, mode="I;16").save(depth_path_16bit)
+
+    peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    print("\n" + "=" * 50)
+    print("             DEPTH ESTIMATION METRICS")
+    print("=" * 50)
+    print(f" Model: {DEPTH_MODEL}")
+    print(f" Input size: {image.size}")
+    print(f" Inference time: {latency*1000:.1f} ms")
+    print(f" Peak VRAM Utilized: {peak_vram:.2f} GB")
+    print(f" saved 8-bit preview -> {depth_path_8bit}")
+    print(f" saved 16-bit raw    -> {depth_path_16bit}")
+    print("=" * 50)
+
+    return depth_vis, depth_np
+
+
+def unload_depth_model(processor, model):
+    del processor, model
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print(f" GPU mem after depth-model unload: "
+          f"{torch.cuda.memory_allocated() / (1024**3):.2f} GB allocated, "
+          f"{torch.cuda.memory_reserved() / (1024**3):.2f} GB reserved")
+
+
+if __name__ == "__main__":
+    cfg = run_inputs()
+
+    init_image = load_image(cfg["image_source"])
+    init_image, click_points, _, _ = resize_image_and_points(
+        init_image, cfg["click_points"], max_dim=1024, multiple_of=16,
+    )
+    print(f" init_image size (resized): {init_image.size}")
+    reference_image = load_image("https://res.cloudinary.com/econjyh1/image/upload/f_auto,q_auto/bed1_wwt6ms")
+    sam2_predictor, sam2_model = load_sam2_predictor(SAM2_CFG, SAM2_CKPT)
+    sam2_predictor.set_image(np.array(init_image))
+
+    full_mask = segment_clicked_objects(
+        sam2_predictor, click_points, init_image,
+        preselected_choices=cfg["preselected_choices"],
+    )
+
+    unload_sam2(sam2_predictor, sam2_model)
+
+    save_masks(init_image, full_mask, click_points)
+
+    if cfg["mode"] == "drag":
+        cutout, bbox, centroid = extract_object_cutout(init_image, full_mask, feather_px=3)
+
+        lama = load_lama_model()
+        clean_bg = remove_object_from_scene(lama, init_image, full_mask, dilate_px=cfg["dilate_px"])
+        unload_lama_model(lama)
+
+        meta = save_dragdrop_assets(clean_bg, cutout, bbox, centroid)
+
+        if not cfg["skip_depth"]:
+            depth_processor, depth_model = load_depth_model()
+            depth_vis, depth_raw = run_depth_estimation(depth_processor, depth_model, init_image)
+            unload_depth_model(depth_processor, depth_model)
+            print("[SUCCESS] Depth maps saved for placement scaling: "
+                  "depth_preview.png (8-bit) + depth_raw16.png (16-bit)")
+
+        print("\n[SUCCESS] Drag-and-drop assets ready:")
+        print("  background_clean.png  — scene with object removed")
+        print("  object_cutout.png     — the draggable object (RGBA, feathered edge)")
+        print("  object_meta.json      — bbox/centroid for placement + depth scaling")
+        print("  depth_preview.png     — for depth-aware auto-scale in the frontend")
+
+    else:
+        pipe = load_flux_pipeline(FLUX_MODEL)
+        prompt_embeds, pooled_prompt_embeds = encode_prompt_and_free_encoders(pipe, cfg["prompt"], reference_image)
+
+        final_output = run_flux_fill_with_metrics(
+            pipe, init_image, full_mask,
+            prompt_embeds, pooled_prompt_embeds,
+            steps=cfg["steps"],
+            warmup_steps=cfg["warmup_steps"],
+            guidance=cfg["guidance"],
+            dilate_px=cfg["dilate_px"],
+            seed=SEED,
+        )
+
+        unload_flux(pipe)
+
+        output_filename = "flux_fill_final.png"
+        final_output.save(output_filename)
+        print(f"\n[SUCCESS] Image successfully processed and saved to: {output_filename}")
+
+        if not cfg["skip_depth"]:
+            depth_processor, depth_model = load_depth_model()
+            depth_vis, depth_raw = run_depth_estimation(depth_processor, depth_model, final_output)
+            unload_depth_model(depth_processor, depth_model)
+            print("[SUCCESS] Depth maps saved: depth_preview.png (8-bit) + depth_raw16.png (16-bit)")
+            print("          Hand color (flux_fill_final.png) + depth_raw16.png to the WebGL parallax shader.")
+        else:
+            print("[*] --skip-depth set, no depth map generated.")
