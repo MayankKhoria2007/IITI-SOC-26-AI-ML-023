@@ -1,0 +1,1840 @@
+import io
+import os
+import time
+import uuid
+from contextlib import contextmanager
+from typing import Optional, List
+
+import modal
+from PIL import Image
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+
+# ---------------------------------------------------------------------------
+# TeaCache constants
+# ---------------------------------------------------------------------------
+POLY_COEFFS = [
+    4.98651651e+02,
+   -2.83781631e+02,
+    5.58554382e+01,
+   -3.82021401e+00,
+    2.64230861e-01,
+]
+REL_L1_THRESH = 0.25
+MAX_CONSECUTIVE_SKIPS = 2
+
+DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+
+
+@contextmanager
+def timed(label: str):
+    t0 = time.time()
+    try:
+        yield
+    finally:
+        print(f"[TIMER] {label}: {time.time() - t0:.3f}s")
+
+
+def _poly1d(coeffs, x):
+    result = 0.0
+    for c in coeffs:
+        result = result * x + c
+    return result
+
+def pad_to_square(image):
+    image = image.convert("RGB")
+    w, h = image.size
+    side = max(w, h)
+    padded = Image.new("RGB", (side, side), (255, 255, 255))
+    x = (side - w) // 2
+    y = (side - h) // 2
+    padded.paste(image, (x, y))
+    return padded
+
+def pad_mask_to_square(mask_image):
+    mask_image = mask_image.convert("L")
+    w, h = mask_image.size
+    side = max(w, h)
+    padded = Image.new("L", (side, side), 0)
+    x = (side - w) // 2
+    y = (side - h) // 2
+    padded.paste(mask_image, (x, y))
+    return padded
+
+def remove_pad(padded_image, original_width, original_height):
+    cur_w, cur_h = padded_image.size
+    left = (cur_w - original_width) // 2
+    top = (cur_h - original_height) // 2
+    right = left + original_width
+    bottom = top + original_height
+    return padded_image.crop((left, top, right, bottom))
+
+def apply_teacache(pipe, num_steps: int, rel_l1_thresh: float = REL_L1_THRESH):
+    """Patch the transformer's forward pass with TeaCache step-skipping."""
+    transformer = getattr(pipe.transformer, "_orig_mod", pipe.transformer)
+
+    transformer.tc_cnt = 0
+    transformer.tc_num_steps = num_steps
+    transformer.tc_rel_l1_thresh = rel_l1_thresh
+    transformer.tc_accumulated_rel_l1 = 0.0
+    transformer.tc_previous_modulated_input = None
+    transformer.tc_previous_residual = None
+    transformer.tc_skip_count = 0
+    transformer.tc_consecutive_skips = 0
+    transformer.tc_enabled = True
+    transformer.tc_latent_channels = None
+
+    original_forward = transformer.forward
+
+    def teacache_forward(
+        hidden_states,
+        encoder_hidden_states=None,
+        pooled_projections=None,
+        timestep=None,
+        img_ids=None,
+        txt_ids=None,
+        guidance=None,
+        joint_attention_kwargs=None,
+        return_dict=True,
+        **kwargs,
+    ):
+        temb = transformer.time_text_embed(timestep, guidance, pooled_projections)
+        inp = transformer.x_embedder(hidden_states)
+        temb_ = temb.clone()
+        modulated_inp, _, _, _, _ = transformer.transformer_blocks[0].norm1(
+            inp, emb=temb_
+        )
+
+        cnt = transformer.tc_cnt
+        n_steps = transformer.tc_num_steps
+
+        if cnt == 0 or cnt == n_steps - 1:
+            should_calc = True
+            transformer.tc_accumulated_rel_l1 = 0.0
+        else:
+            rel_diff = (
+                (modulated_inp - transformer.tc_previous_modulated_input).abs().mean()
+                / transformer.tc_previous_modulated_input.abs().mean()
+            ).cpu().item()
+            transformer.tc_accumulated_rel_l1 += float(_poly1d(POLY_COEFFS, rel_diff))
+            if (
+                transformer.tc_accumulated_rel_l1 < transformer.tc_rel_l1_thresh
+                and transformer.tc_consecutive_skips < MAX_CONSECUTIVE_SKIPS
+            ):
+                should_calc = False
+            else:
+                should_calc = True
+                transformer.tc_accumulated_rel_l1 = 0.0
+
+        transformer.tc_previous_modulated_input = modulated_inp.clone()
+        transformer.tc_cnt += 1
+
+        if not should_calc:
+            transformer.tc_skip_count += 1
+            transformer.tc_consecutive_skips += 1
+            lc = transformer.tc_latent_channels
+            latent_slice = hidden_states[..., :lc]
+            out = latent_slice + transformer.tc_previous_residual
+            if return_dict:
+                from diffusers.models.modeling_outputs import Transformer2DModelOutput
+                return Transformer2DModelOutput(sample=out)
+            return (out,)
+
+        transformer.tc_consecutive_skips = 0
+        output = original_forward(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            pooled_projections=pooled_projections,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            guidance=guidance,
+            joint_attention_kwargs=joint_attention_kwargs,
+            return_dict=return_dict,
+            **kwargs,
+        )
+
+        out_tensor = output.sample if return_dict else output[0]
+        transformer.tc_latent_channels = out_tensor.shape[-1]
+        input_latent_slice = hidden_states[..., : out_tensor.shape[-1]].detach().clone()
+        transformer.tc_previous_residual = out_tensor.detach().clone() - input_latent_slice
+        return output
+
+    transformer.forward = teacache_forward
+    return original_forward
+
+def remove_teacache(pipe, original_forward):
+    """Restore the original transformer forward and log skip stats."""
+    transformer = getattr(pipe.transformer, "_orig_mod", pipe.transformer)
+    print(
+        f" TeaCache skipped {transformer.tc_skip_count}/{transformer.tc_num_steps} steps"
+    )
+    transformer.forward = original_forward
+    transformer.tc_enabled = False
+    transformer.tc_cnt = 0
+    transformer.tc_skip_count = 0
+
+# ---------------------------------------------------------------------------
+# Modal app + volumes
+# ---------------------------------------------------------------------------
+APP_NAME = "herin_final"
+
+# ---------------------------------------------------------------------------
+# Secrets attached to this app (as configured in the Modal dashboard):
+#   - huggingface-secret   -> provides HF_TOKEN / HUGGINGFACE_TOKEN
+#   - CLOUDINARY_API_KEY   -> provides CLOUDINARY_API_KEY
+#   - CLOUDINARY_CLOUD_NAME -> provides CLOUDINARY_CLOUD_NAME
+#   - CLOUDINARY_API_SECRET -> provides CLOUDINARY_API_SECRET
+# ---------------------------------------------------------------------------
+ALL_SECRETS = [
+    modal.Secret.from_name("huggingface-secret"),
+    modal.Secret.from_name("CLOUDINARY_API_KEY"),
+    modal.Secret.from_name("CLOUDINARY_CLOUD_NAME"),
+    modal.Secret.from_name("CLOUDINARY_API_SECRET"),
+]
+
+# Session-state volume: base images, masks, click history.
+volume = modal.Volume.from_name("flux-sam2-volume", create_if_missing=True)
+
+# Model-weights cache volume: persists HF downloads across cold starts.
+# First boot downloads everything; subsequent boots load from this volume.
+MODEL_CACHE_DIR = "/model-cache"
+model_cache_volume = modal.Volume.from_name("flux-sam2-model-cache", create_if_missing=True)
+
+container_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04",
+        add_python="3.11",
+    )
+    .apt_install("git", "libgl1", "libglib2.0-0")
+    # 1. Torch first — everything pins against it
+    .pip_install(
+        "torch==2.10.0",
+        "torchvision",
+        index_url="https://download.pytorch.org/whl/cu128",
+    )
+    # 2. Pure-Python packages (bitsandbytes for NF4 T5 quantization)
+    .pip_install(
+        "accelerate",
+        "bitsandbytes",
+        "cloudinary",
+        "diffusers",
+        "fastapi[standard]",
+        "huggingface_hub",
+        "hydra-core",
+        "numpy",
+        "opencv-python-headless",
+        "pillow",
+        "pydantic",
+        "scipy",
+        "sentencepiece",
+        "transformers",
+        "simple-lama-inpainting",
+    )
+    # 3. Nunchaku prebuilt wheel (torch2.10 + cu128)
+    .pip_install(
+        "https://github.com/nunchaku-tech/nunchaku/releases/download/v1.2.1/"
+        "nunchaku-1.2.1+cu12.8torch2.10-cp311-cp311-linux_x86_64.whl"
+    )
+    # 4. SAM2 from source
+    .pip_install("git+https://github.com/facebookresearch/sam2.git")
+)
+
+app = modal.App(APP_NAME)
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+class ClickRequest(BaseModel):
+    session_id: Optional[str] = None
+    image_url: Optional[str] = None
+    cx: float
+    cy: float
+    max_dim: int = 1024
+    reference_mask: bool = False
+
+class ChooseRequest(BaseModel):
+    session_id: str
+    candidate_index: int
+    click_index: Optional[int] = None
+    reference_mask: bool = False
+
+class RemoveRequest(BaseModel):
+    session_id: str
+    click_indices: List[int]
+    reference_mask: bool = False
+
+class ClearRequest(BaseModel):
+    session_id: str
+    reference_mask: bool = False
+
+class RemoveObjectRequest(BaseModel):
+    session_id: str
+    inpaint_radius: int = 7
+    dilate_px: int = 3
+
+class GenerateRequest(BaseModel):
+    session_id: str
+    prompt: str
+    image_url: str
+    reference_image_url: Optional[str] = None
+    steps: int = 16
+    guidance: float = 35.0
+    dilate_px: int = 45
+    seed: int = 0
+    teacache: bool = True
+    teacache_thresh: float = REL_L1_THRESH
+    match_ref_bbox: bool = True
+    tile_size: int = 698
+    fill_size: int = 1024
+    sharpen: bool = True
+    sharpen_radius: float = 2.0
+    sharpen_percent: int = 150
+    sharpen_threshold: int = 2
+    m1_bbox_expand_px: int = 20
+    diff_cleanup_dilate_px: int = 3
+
+class ExtractFromSessionRequest(BaseModel):
+    """
+    POST /segment/extract
+    Uses the running mask already built in a session (via /segment/click + /segment/choose)
+    to extract the object cutout, fill the background with LaMa, and run depth estimation.
+    Returns all Cloudinary URLs plus a `mode` hint the client uses for UI routing:
+      - mode="move"     → user wants to drag-and-drop the cutout onto another scene
+      - mode="generate" → user wants to FLUX-inpaint the masked region instead
+    """
+    session_id: str
+    mode: str = "move"       # "move" | "generate" — client UI routing hint
+    dilate_px: int = 10      # mask dilation for LaMa fill (avoids halo artifacts)
+    feather_px: int = 3      # soft-edge radius on the cutout alpha channel
+
+# ---------------------------------------------------------------------------
+# Single GPU-resident class
+# ---------------------------------------------------------------------------
+@app.cls(
+    gpu="L4",
+    image=container_image,
+    volumes={
+        "/data":         volume,             # session state (masks, clicks)
+        MODEL_CACHE_DIR: model_cache_volume,  # persisted model weights
+    },
+    secrets=ALL_SECRETS,
+    timeout=600,
+    scaledown_window=180,
+    # ---------------------------------------------------------------------------
+    # Memory snapshot: checkpoint the container right after all models are
+    # loaded onto the GPU.  On cold start Modal restores from the snapshot,
+    # skipping the multi-minute HuggingFace download + CUDA init entirely.
+    # GPU snapshot REMOVED: Nunchaku INT4 CUDA kernels cause SIGSEGV on restore
+    # (confirmed 2026-07-20 — CPU-only memory snapshot restores cleanly in ~12s)
+    # ---------------------------------------------------------------------------
+    enable_memory_snapshot=True,
+)
+class CombinedPipeline:
+
+    # ── Phase 1: snapshotted (runs once, result is checkpointed) ─────────────
+    @modal.enter(snap=True)
+    def load_models(self):
+        """
+        Runs once during the first container boot.  The resulting in-memory +
+        GPU state is captured as a snapshot.  On every subsequent cold start
+        Modal restores from that snapshot, skipping this entire method.
+        """
+        import os as _os
+        _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+        # Create model cache subdirectory for simple-lama and symlink it from ~/.cache
+        _os.makedirs(f"{MODEL_CACHE_DIR}/simple-lama", exist_ok=True)
+        _os.makedirs("/root/.cache", exist_ok=True)
+        if not _os.path.exists("/root/.cache/simple-lama"):
+            try:
+                _os.symlink(f"{MODEL_CACHE_DIR}/simple-lama", "/root/.cache/simple-lama")
+                print("[*] Symlinked LaMa cache directory to persistent volume.")
+            except Exception as e:
+                print(f"[*] Warning: failed to symlink LaMa cache: {e}")
+
+        # Point HF Hub + PyTorch caches to the persistent volume — must be set
+        # before any HuggingFace library call so the cache is picked up correctly.
+        _os.environ["HF_HOME"]               = MODEL_CACHE_DIR
+        _os.environ["HUGGINGFACE_HUB_CACHE"] = MODEL_CACHE_DIR
+        _os.environ["TRANSFORMERS_CACHE"]    = MODEL_CACHE_DIR
+        _os.environ["HF_DATASETS_CACHE"]     = MODEL_CACHE_DIR
+        _os.environ["TORCH_HOME"]            = MODEL_CACHE_DIR
+        print(f"[*] Weight cache: {MODEL_CACHE_DIR}")
+
+        import numpy as np
+        import torch
+        from huggingface_hub import login
+
+        token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGINGFACE_TOKEN")
+        if token:
+            login(token=token)
+        else:
+            print(
+                "[*] WARNING: no HF_TOKEN / HUGGINGFACE_TOKEN found in env — "
+                "check that 'huggingface-secret' actually defines one of these keys."
+            )
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        self.np = np
+        self.torch = torch
+
+        # [MEM PATCH] reset the peak-memory tracker so the peak reported at the
+        # end of this method reflects only what load_models itself allocates.
+        torch.cuda.reset_peak_memory_stats()
+        total_t0 = time.time()
+
+        # ── A. SAM2 ──────────────────────────────────────────────────────────
+        with timed("Load SAM2 (facebook/sam2.1-hiera-large)"):
+            print("[*] Loading SAM2 (facebook/sam2.1-hiera-large)...")
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            self.sam_predictor = SAM2ImagePredictor.from_pretrained(
+                "facebook/sam2.1-hiera-large",
+                device="cuda",
+            )
+            print(f"    SAM2 loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # ── B. T5-XXL in NF4 (4-bit NormalFloat) ────────────────────────────
+        # NF4 reduces T5-XXL from ~9.4 GB → ~2.4 GB of VRAM.
+        # compute_dtype=bfloat16 keeps matmul precision high during the forward pass.
+        # bitsandbytes handles device placement automatically; no .to("cuda") needed.
+        with timed("Load T5-XXL text encoder (NF4)"):
+            print("[*] Loading T5-XXL in NF4 (bitsandbytes)...")
+            from transformers import T5EncoderModel, BitsAndBytesConfig
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            text_encoder_2 = T5EncoderModel.from_pretrained(
+                "black-forest-labs/FLUX.1-Fill-dev",
+                subfolder="text_encoder_2",
+                quantization_config=bnb_cfg,
+                device_map="cuda",
+                token=token,
+            )
+            print(f"    T5 NF4 loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # ── C. Nunchaku INT4/FP4 FLUX transformer ────────────────────────────
+        with timed("Load Nunchaku int4/fp4 transformer"):
+            print("[*] Loading Nunchaku int4/fp4 transformer...")
+            from nunchaku import NunchakuFluxTransformer2dModel
+            from nunchaku.utils import get_precision
+            precision = get_precision()
+            transformer = NunchakuFluxTransformer2dModel.from_pretrained(
+                f"nunchaku-tech/nunchaku-flux.1-fill-dev/"
+                f"svdq-{precision}_r32-flux.1-fill-dev.safetensors"
+            )
+            print(f"    Transformer loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # ── D. FluxFillPipeline ───────────────────────────────────────────────
+        with timed("Assemble FluxFillPipeline"):
+            print("[*] Assembling FluxFillPipeline...")
+            from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
+            self.pipe = FluxFillPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-Fill-dev",
+                transformer=transformer,
+                text_encoder_2=text_encoder_2,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                token=token,
+            ).to("cuda")
+            self.pipe.enable_vae_slicing()
+            self.pipe.enable_vae_tiling()
+            self.pipe.set_progress_bar_config(disable=True)
+            print(f"    FluxFill loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        import inspect as _inspect
+        self._pipe_call_params = set(
+            _inspect.signature(self.pipe.__call__).parameters.keys()
+        )
+        print(f"[*] Pipeline __call__ accepts: {sorted(self._pipe_call_params)}")
+
+        # ── E. FluxPriorRedux (shares CLIP + T5 with pipe) ───────────────────
+        with timed("Load FLUX.1-Redux prior"):
+            print("[*] Loading FLUX.1-Redux prior...")
+            from diffusers import FluxPriorReduxPipeline
+            self.pipe.prior_redux = FluxPriorReduxPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-Redux-dev",
+                torch_dtype=torch.bfloat16,
+                text_encoder=self.pipe.text_encoder,
+                text_encoder_2=self.pipe.text_encoder_2,
+                tokenizer=self.pipe.tokenizer,
+                tokenizer_2=self.pipe.tokenizer_2,
+            ).to("cuda")
+            # [MEM PATCH] Redux prior had no VRAM checkpoint before — add one.
+            print(f"    FLUX.1-Redux prior loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # ── F. LaMa (background inpainting) ──────────────────────────────────
+        with timed("Load LaMa"):
+            print("[*] Loading LaMa (lightweight inpainting model)...")
+            from simple_lama_inpainting import SimpleLama
+            self.lama = SimpleLama(device="cuda")
+            print(f"    LaMa loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # ── G. Depth-Anything-V2-Small ────────────────────────────────────────
+        # Needed by /segment/extract (mode="move") to produce a depth map
+        # alongside the object cutout and clean background.
+        with timed(f"Load Depth model ({DEPTH_MODEL})"):
+            print(f"[*] Loading Depth model ({DEPTH_MODEL})...")
+            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+            self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL)
+            self.depth_model = AutoModelForDepthEstimation.from_pretrained(
+                DEPTH_MODEL, torch_dtype=torch.float16
+            ).to("cuda").eval()
+            print(f"    Depth model ready. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # [MEM PATCH] full picture at the end of load_models: allocated (live
+        # tensors), reserved (PyTorch's caching-allocator pool, always >=
+        # allocated), and peak (highest allocated value seen during this
+        # method — catches any transient spike during weight conversion).
+        print(f"[*] All models loaded. Total VRAM allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        print(f"[*] All models loaded. Total VRAM reserved:  {torch.cuda.memory_reserved()/1e9:.2f} GB")
+        print(f"[*] All models loaded. Peak VRAM allocated so far: {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
+        print(f"[TIMER] load_models TOTAL: {time.time() - total_t0:.3f}s")
+        print("[*] Snapshot will be taken after this method returns.")
+
+    # ── Phase 2: post-restore runtime init (runs on every container start) ────
+    @modal.enter(snap=False)
+    def configure_runtime(self):
+        """
+        Runs after the snapshot is restored (or immediately after load_models on
+        the very first boot).  Keeps live credentials / SDK state out of the
+        frozen checkpoint so they are always fresh on every container start.
+        """
+        import os as _os
+        import cloudinary
+
+        # Configure Cloudinary with live secrets — never bake API keys into a snapshot
+        cloudinary.config(
+            cloud_name=_os.environ.get("CLOUDINARY_CLOUD_NAME"),
+            api_key=_os.environ.get("CLOUDINARY_API_KEY"),
+            api_secret=_os.environ.get("CLOUDINARY_API_SECRET"),
+            secure=True,
+        )
+        print("[*] Cloudinary configured (post-snapshot runtime init).")
+
+        # [MEM PATCH] snapshot restore can bring back a container whose CUDA
+        # context isn't fully re-attached yet; log what we see immediately
+        # after restore so restore-time VRAM state is visible in the logs too.
+        try:
+            import torch as _torch
+            print(f"[*] Post-restore VRAM check: allocated={_torch.cuda.memory_allocated()/1e9:.2f}GB "
+                  f"reserved={_torch.cuda.memory_reserved()/1e9:.2f}GB")
+        except Exception as e:
+            print(f"[*] Post-restore VRAM check failed: {e}")
+
+    # ── internal helpers ─────────────────────────────────────────────────────
+
+    def _clean_mask(self, mask01, close_iterations=8):
+        from scipy.ndimage import binary_closing, binary_fill_holes
+        from scipy.ndimage import label as cc_label
+
+        mask = mask01.astype(bool)
+        mask = binary_closing(mask, iterations=close_iterations)
+        mask = binary_fill_holes(mask)
+        labeled, count = cc_label(mask)
+        if count > 1:
+            sizes = self.np.bincount(labeled.ravel())
+            sizes[0] = 0
+            mask = labeled == sizes.argmax()
+        return mask.astype(self.np.uint8)
+
+    def _recompute_combined(self, clicks: list, session_dir: str, target_size=None):
+        import os as _os
+        from PIL import Image as _Image
+        active_masks = []
+        for c in clicks:
+            if c["active"] and c.get("candidate_index") is not None:
+                mask_path = (
+                    f"{session_dir}/candidate_mask_{c['index']}_{c['candidate_index']}.png"
+                )
+                if _os.path.exists(mask_path):
+                    mask_img = _Image.open(mask_path).convert("L")
+                    if target_size is not None and mask_img.size != target_size:
+                        print(
+                            f"[recompute_combined] WARNING: mask for click {c['index']} "
+                            f"has size {mask_img.size} but expected {target_size} — "
+                            f"resizing mask to match before combining."
+                        )
+                        mask_img = mask_img.resize(target_size, _Image.NEAREST)
+                    mask_np = (self.np.array(mask_img) > 127).astype(self.np.uint8)
+                    active_masks.append(mask_np)
+        if not active_masks:
+            return None
+
+        # Extra safety net: even with target_size resizing above, guard against
+        # any remaining shape mismatch by resizing every subsequent mask to the
+        # shape of the first one.
+        combined = active_masks[0].copy()
+        ref_shape = combined.shape
+        for m in active_masks[1:]:
+            if m.shape != ref_shape:
+                print(
+                    f"[recompute_combined] WARNING: mask shape {m.shape} does not match "
+                    f"reference shape {ref_shape} — resizing to match before combining."
+                )
+                m_img = _Image.fromarray((m * 255).astype(self.np.uint8))
+                m_img = m_img.resize((ref_shape[1], ref_shape[0]), _Image.NEAREST)
+                m = (self.np.array(m_img) > 127).astype(self.np.uint8)
+            combined = self.np.logical_or(combined, m).astype(self.np.uint8)
+        return combined
+
+    def _apply_removals(self, clicks: list, remove_indices: List[int]) -> List[int]:
+        applied = []
+        valid_indices = {c["index"] for c in clicks}
+        for idx in remove_indices:
+            if idx not in valid_indices:
+                print(f" [WARNING] cannot remove click {idx}: no such click in session.")
+                continue
+            matched = next(c for c in clicks if c["index"] == idx)
+            if not matched["active"]:
+                print(f" [WARNING] click {idx} is already inactive/removed.")
+                continue
+            matched["active"] = False
+            applied.append(idx)
+            print(
+                f" [INFO] removed click {idx} "
+                f"(cx={matched['cx']}, cy={matched['cy']}) from the union."
+            )
+        return applied
+
+    def _active_click_indices(self, clicks: list) -> List[int]:
+        return [c["index"] for c in clicks if c["active"]]
+
+    def _extract_cutout(self, image_rgb, mask01, feather_px: int = 3):
+        """
+        Build a feathered RGBA cutout of the masked object.
+        Returns:
+            cutout   – PIL RGBA (cropped to bbox + feather margin)
+            bbox     – (x0, y0, x1, y1) in original-image pixel space
+            centroid – (cx, cy)
+        """
+        from PIL import Image as _Image
+        from scipy.ndimage import distance_transform_edt
+
+        mask  = mask01.astype(bool)
+        dist  = distance_transform_edt(mask)
+        alpha = self.np.zeros(mask.shape, dtype=self.np.float32)
+        alpha[mask] = self.np.clip(dist[mask] / max(feather_px, 1), 0.0, 1.0)
+
+        rgba        = self.np.dstack(
+            [self.np.array(image_rgb), (alpha * 255).astype(self.np.uint8)]
+        )
+        cutout_full = _Image.fromarray(rgba, mode="RGBA")
+
+        ys, xs = self.np.where(mask)
+        y0 = max(int(ys.min()) - feather_px, 0)
+        y1 = min(int(ys.max()) + feather_px, mask.shape[0])
+        x0 = max(int(xs.min()) - feather_px, 0)
+        x1 = min(int(xs.max()) + feather_px, mask.shape[1])
+
+        cutout   = cutout_full.crop((x0, y0, x1, y1))
+        centroid = (int(xs.mean()), int(ys.mean()))
+        return cutout, (x0, y0, x1, y1), centroid
+
+    def _run_depth(self, image_rgb):
+        """
+        Run Depth-Anything-V2-Small on a PIL RGB image.
+        Returns:
+            depth_pil_8bit  – PIL "L" image (0-255 grayscale)
+            depth_pil_16bit – PIL "I;16" image (0-65535)
+            depth_np        – raw float32 normalised depth array
+        """
+        from PIL import Image as _Image
+
+        self.torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        inputs = self.depth_processor(
+            images=image_rgb, return_tensors="pt"
+        ).to("cuda")
+        inputs = {
+            k: v.to(self.torch.float16) if v.dtype == self.torch.float32 else v
+            for k, v in inputs.items()
+        }
+
+        with self.torch.inference_mode():
+            outputs         = self.depth_model(**inputs)
+            predicted_depth = outputs.predicted_depth
+
+        prediction = self.torch.nn.functional.interpolate(
+            predicted_depth.unsqueeze(1).float(),
+            size=(image_rgb.height, image_rgb.width),
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
+
+        self.torch.cuda.synchronize()
+        latency = time.perf_counter() - t0
+
+        depth_np     = prediction.cpu().numpy().astype(self.np.float32)
+        d_min, d_max = depth_np.min(), depth_np.max()
+        depth_norm   = (depth_np - d_min) / max(d_max - d_min, 1e-6)
+
+        depth_8bit  = (depth_norm * 255.0).astype(self.np.uint8)
+        depth_16bit = (depth_norm * 65535.0).astype(self.np.uint16)
+
+        peak_vram = self.torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(f"[depth] latency={latency*1000:.1f}ms  peak_vram={peak_vram:.2f}GB  "
+              f"input={image_rgb.size}")
+
+        return (
+            _Image.fromarray(depth_8bit,  mode="L"),
+            _Image.fromarray(depth_16bit, mode="I;16"),
+            depth_np,
+        )
+
+    def _upload_to_cloudinary(self, pil_image, public_id: str, fmt: str = "PNG") -> str:
+        """Upload a PIL image to Cloudinary; return its secure URL.
+        `fmt` defaults to PNG; pass 'PNG' explicitly for 16-bit/RGBA images."""
+        import cloudinary.uploader
+        import io as _io
+        with timed(f"Upload to Cloudinary ({public_id})"):
+            buf = _io.BytesIO()
+            pil_image.save(buf, format=fmt)
+            buf.seek(0)
+            result = cloudinary.uploader.upload(
+                buf,
+                public_id=public_id,
+                folder="flux-sam2",
+                overwrite=True,
+                resource_type="image",
+            )
+        return result["secure_url"]
+
+    def _download_image(self, url: str):
+        import urllib.request as _urlreq
+        import io as _io
+        from PIL import Image
+        with timed(f"Download image ({url})"):
+            try:
+                req = _urlreq.Request(
+                    url,
+                    headers={"User-Agent": "flux-sam2-pipeline/2.0 (contact: admin@example.com)"},
+                )
+                with _urlreq.urlopen(req) as resp:
+                    data = resp.read()
+                return Image.open(_io.BytesIO(data)).convert("RGB")
+            except Exception as e:
+                raise ValueError(f"Failed to download {url!r}: {e}") from None
+
+    def _call_pipe_safe(self, **kwargs):
+        accepted = getattr(self, "_pipe_call_params", None)
+        if accepted is None:
+            import inspect as _inspect
+            accepted = set(_inspect.signature(self.pipe.__call__).parameters.keys())
+            self._pipe_call_params = accepted
+
+        clean_kwargs = {}
+        for k, v in kwargs.items():
+            if k in accepted:
+                clean_kwargs[k] = v
+            else:
+                print(
+                    f"[generate] pipeline does not accept '{k}' in this diffusers "
+                    f"version — dropping it (no effect from this argument)."
+                )
+        with timed("FluxFill pipe() forward/diffusion call"):
+            result = self.pipe(**clean_kwargs)
+        # [MEM PATCH] this is the number you actually want: VRAM immediately
+        # after the diffusion forward pass (the biggest memory consumer in
+        # the whole request — attention maps + latents for the full canvas).
+        print(f"[diffusion] VRAM after pipe() call: allocated={self.torch.cuda.memory_allocated()/1e9:.2f}GB "
+              f"reserved={self.torch.cuda.memory_reserved()/1e9:.2f}GB "
+              f"peak-so-far={self.torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+        return result
+
+    def _progressive_upscale(self, img, target_w, target_h):
+        cur_w, cur_h = img.size
+        if target_w <= cur_w and target_h <= cur_h:
+            return img.resize((target_w, target_h), Image.LANCZOS)
+        while cur_w * 2 < target_w and cur_h * 2 < target_h:
+            cur_w, cur_h = cur_w * 2, cur_h * 2
+            img = img.resize((cur_w, cur_h), Image.LANCZOS)
+        return img.resize((target_w, target_h), Image.LANCZOS)
+
+    def _sharpen(self, img, radius=2.0, percent=150, threshold=2):
+        from PIL import ImageFilter
+        return img.filter(
+            ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold)
+        )
+
+    def _pad_and_resize_square(self, img, size):
+        if img.mode == "L":
+            padded = pad_mask_to_square(img)
+            resample = Image.NEAREST
+        else:
+            padded = pad_to_square(img)
+            resample = Image.LANCZOS
+        return padded.resize((size, size), resample)
+
+    def _get_object_bbox(self, img_rgb, bg_thresh=10):
+        arr = self.np.array(img_rgb.convert("RGB"))
+        h, w = arr.shape[:2]
+        non_bg = self.np.any(arr > bg_thresh, axis=-1)
+        ys, xs = self.np.where(non_bg)
+        if len(xs) == 0 or len(ys) == 0:
+            return (0, 0, w, h)
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x1 = max(x1, x0 + 1)
+        y1 = max(y1, y0 + 1)
+        return (x0, y0, x1, y1)
+
+    def _get_object_bbox_scaled(self, ref_original, canvas_size, bg_thresh=10):
+        rw, rh = ref_original.size
+        side = max(rw, rh)
+        pad_x = (side - rw) // 2
+        pad_y = (side - rh) // 2
+        scale = canvas_size / side
+
+        x0, y0, x1, y1 = self._get_object_bbox(ref_original, bg_thresh=bg_thresh)
+
+        sx0 = (x0 + pad_x) * scale
+        sy0 = (y0 + pad_y) * scale
+        sx1 = (x1 + pad_x) * scale
+        sy1 = (y1 + pad_y) * scale
+
+        sx1 = max(sx1, sx0 + 1)
+        sy1 = max(sy1, sy0 + 1)
+        return (int(round(sx0)), int(round(sy0)), int(round(sx1)), int(round(sy1)))
+
+    def _match_mask_to_ref_bbox(self, mask01, ref_bbox, canvas_size):
+        ys, xs = self.np.where(mask01 > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return mask01, (0, 0), (0, 0)
+
+        mx0, mx1 = int(xs.min()), int(xs.max()) + 1
+        my0, my1 = int(ys.min()), int(ys.max()) + 1
+        mask_w, mask_h = mx1 - mx0, my1 - my0
+
+        rx0, ry0, rx1, ry1 = ref_bbox
+        ref_w = max(rx1 - rx0, 1)
+        ref_h = max(ry1 - ry0, 1)
+        ref_w = min(ref_w, canvas_size)
+        ref_h = min(ref_h, canvas_size)
+
+        scale_w = mask_w / float(ref_w) if ref_w > 0 else 1.0
+        scale_h = mask_h / float(ref_h) if ref_h > 0 else 1.0
+        scale_factor = min(scale_w, scale_h)
+
+        target_w = max(int(round(ref_w * scale_factor)), 1)
+        target_h = max(int(round(ref_h * scale_factor)), 1)
+
+        if target_w > canvas_size or target_h > canvas_size:
+            clamp_scale = min(canvas_size / target_w, canvas_size / target_h)
+            target_w = max(int(round(target_w * clamp_scale)), 1)
+            target_h = max(int(round(target_h * clamp_scale)), 1)
+
+        print(f"[match_mask_to_ref_bbox] mask(w,h)=({mask_w},{mask_h}) "
+              f"ref(w,h)=({ref_w},{ref_h}) scale_w={scale_w:.3f} scale_h={scale_h:.3f} "
+              f"contain_scale={scale_factor:.3f} -> target(w,h)=({target_w},{target_h})")
+
+        sub = Image.fromarray((mask01[my0:my1, mx0:mx1] * 255).astype(self.np.uint8))
+        try:
+            resized_sub = sub.resize((target_w, target_h), Image.NEAREST)
+        except Exception:
+            return mask01, (mask_w, mask_h), (ref_w, ref_h)
+
+        mask_cx = (mx0 + mx1) // 2
+        new_left = mask_cx - target_w // 2
+        new_top = my1 - target_h
+
+        canvas = Image.new("L", (canvas_size, canvas_size), 0)
+        canvas.paste(resized_sub, (new_left, new_top))
+        new_mask01 = (self.np.array(canvas) > 127).astype(self.np.uint8)
+        return new_mask01, (mask_w, mask_h), (ref_w, ref_h)
+
+    def _mask_bbox_dims(self, mask_bool):
+        ys, xs = self.np.where(mask_bool)
+        if len(xs) == 0 or len(ys) == 0:
+            return None, (0, 0)
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        return (x0, y0, x1, y1), (x1 - x0, y1 - y0)
+
+    def _get_generated_object_mask(self, arr, region_mask_bool, bg_color,
+                                   color_thresh=30.0, smooth_sigma=1.0, close_iterations=3):
+        from scipy.ndimage import gaussian_filter, binary_closing, binary_opening
+
+        region_mask_bool = region_mask_bool.astype(bool)
+        color_dist = self.np.linalg.norm(
+            arr.astype(self.np.float32) - bg_color.reshape(1, 1, 3), axis=-1
+        )
+        color_dist = gaussian_filter(color_dist, sigma=smooth_sigma)
+
+        object_mask = region_mask_bool & (color_dist > color_thresh)
+        object_mask = binary_opening(object_mask, iterations=1)
+        object_mask = binary_closing(object_mask, iterations=close_iterations)
+        return object_mask
+
+    def _lama_fill(self, pil_image_rgb, mask_bool, dilate_px: int = 0, telea_radius: int = 7):
+        if mask_bool.sum() == 0:
+            return pil_image_rgb
+
+        from scipy.ndimage import binary_dilation
+        work_mask = mask_bool
+        if dilate_px > 0:
+            work_mask = binary_dilation(mask_bool, iterations=dilate_px)
+
+        try:
+            with timed("LaMa fill"):
+                mask_img = Image.fromarray(
+                    (work_mask.astype(self.np.uint8) * 255)
+                ).convert("L")
+                result = self.lama(pil_image_rgb.convert("RGB"), mask_img)
+                if not isinstance(result, Image.Image):
+                    result = Image.fromarray(self.np.array(result).astype(self.np.uint8))
+                result = result.convert("RGB")
+            # [MEM PATCH] VRAM right after LaMa's forward pass.
+            print(f"[lama] VRAM after fill: allocated={self.torch.cuda.memory_allocated()/1e9:.2f}GB "
+                  f"reserved={self.torch.cuda.memory_reserved()/1e9:.2f}GB "
+                  f"peak-so-far={self.torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+            return result
+        except Exception as e:
+            print(f"[generate] LaMa fill failed ({e}); falling back to OpenCV Telea inpainting.")
+            with timed("OpenCV Telea fallback inpainting"):
+                import cv2
+                arr = self.np.array(pil_image_rgb.convert("RGB"), dtype=self.np.uint8)
+                mask_u8 = (work_mask.astype(self.np.uint8)) * 255
+                inpainted = cv2.inpaint(arr, mask_u8, inpaintRadius=telea_radius, flags=cv2.INPAINT_TELEA)
+                return Image.fromarray(inpainted)
+
+    def _sample_point_outside_mask(self, arr, exclude_mask_bool, anchor_mask_bool=None,
+                                   margin=10, patch_radius=3):
+        h, w = exclude_mask_bool.shape
+
+        anchor = anchor_mask_bool if (anchor_mask_bool is not None and anchor_mask_bool.sum() > 0) else exclude_mask_bool
+        ys, xs = self.np.where(anchor)
+        if len(xs) == 0:
+            cx, top_y = w // 2, h // 2
+        else:
+            cx = int(round((int(xs.min()) + int(xs.max())) / 2))
+            top_y = int(ys.min())
+
+        cx = min(max(cx, 0), w - 1)
+        y = min(max(top_y, 0), h - 1)
+        while y > 0 and exclude_mask_bool[y, cx]:
+            y -= 1
+        y = max(0, y - margin)
+
+        y0, y1 = max(0, y - patch_radius), min(h, y + patch_radius + 1)
+        x0, x1 = max(0, cx - patch_radius), min(w, cx + patch_radius + 1)
+        patch = arr[y0:y1, x0:x1]
+        return patch.reshape(-1, arr.shape[-1]).mean(axis=0)
+
+    def _build_stitched_canvas(self, target_tile, mask_tile, ref_tile, half):
+        canvas_w, canvas_h = half * 2, half
+
+        canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        canvas.paste(ref_tile, (0, 0))
+        canvas.paste(target_tile, (half, 0))
+
+        canvas_mask = Image.new("L", (canvas_w, canvas_h), 0)
+        canvas_mask.paste(mask_tile, (half, 0))
+
+        return canvas, canvas_mask, (canvas_w, canvas_h)
+
+    # ── /segment/click ────────────────────────────────────────────────────────
+    @modal.method()
+    def segment_click(self, session_id: str, image_url: Optional[str],
+                        cx: float, cy: float, max_dim: int, reference_mask: bool):
+        from PIL import Image, ImageDraw
+        import os as _os
+        import json as _json
+
+        t0_total = time.time()
+
+        volume.reload()
+        session_dir = f"/data/{session_id}"
+        _os.makedirs(session_dir, exist_ok=True)
+
+        if reference_mask:
+            clicks_json_path = f"{session_dir}/reference_clicks.json"
+            base_path = f"{session_dir}/base_reference.png"
+        else:
+            clicks_json_path = f"{session_dir}/clicks.json"
+            base_path = f"{session_dir}/base.png"
+
+        if not _os.path.exists(base_path):
+            if not image_url:
+                raise ValueError(
+                    "No base image for this session — provide image_url on the first click."
+                )
+            original_image = self._download_image(image_url)
+            original_image.save(base_path)
+            volume.commit()
+            volume.reload()
+        else:
+            with timed("Load cached base image from volume"):
+                original_image = Image.open(base_path).convert("RGB")
+
+        clicks = []
+        if _os.path.exists(clicks_json_path):
+            with open(clicks_json_path, "r") as f:
+                clicks = _json.load(f)
+
+        if clicks and clicks[-1].get("candidate_index") is None:
+            click_index = clicks[-1]["index"]
+            clicks[-1] = {
+                "index": click_index,
+                "cx": cx,
+                "cy": cy,
+                "active": False,
+                "candidate_index": None
+            }
+        else:
+            click_index = len(clicks)
+            clicks.append({
+                "index": click_index,
+                "cx": cx,
+                "cy": cy,
+                "active": False,
+                "candidate_index": None
+            })
+
+        with open(clicks_json_path, "w") as f:
+            _json.dump(clicks, f)
+
+        orig_w, orig_h = original_image.size
+
+        with timed("Pad + resize image for SAM2"):
+            side = max(orig_w, orig_h)
+            pad_x = (side - orig_w) // 2
+            pad_y = (side - orig_h) // 2
+            padded_image = pad_to_square(original_image)
+
+            scale = max_dim / side
+            new_dim = max(16, (int(round(side * scale)) // 16) * 16)
+            resized_image = padded_image.resize((new_dim, new_dim), Image.LANCZOS)
+
+        px = min(max(int(round((cx + pad_x) * new_dim / side)), 0), new_dim - 1)
+        py = min(max(int(round((cy + pad_y) * new_dim / side)), 0), new_dim - 1)
+
+        with timed("SAM2 set_image + predict"):
+            self.sam_predictor.set_image(self.np.array(resized_image))
+            coords = self.np.array([[px, py]], dtype=self.np.float32)
+            labels = self.np.array([1], dtype=self.np.int32)
+            masks, scores, _ = self.sam_predictor.predict(
+                point_coords=coords,
+                point_labels=labels,
+                multimask_output=True,
+            )
+        # [MEM PATCH] VRAM right after SAM2's predict call.
+        print(f"[segment_click] VRAM after SAM2 predict: allocated={self.torch.cuda.memory_allocated()/1e9:.2f}GB "
+              f"reserved={self.torch.cuda.memory_reserved()/1e9:.2f}GB "
+              f"peak={self.torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+
+        candidates = []
+        with timed("Build + upload candidate overlays (all candidates)"):
+            for idx, mask_candidate in enumerate(masks):
+                cleaned = self._clean_mask(mask_candidate)
+
+                mask_small      = Image.fromarray((cleaned * 255).astype(self.np.uint8)).convert("L")
+                mask_padded_full  = mask_small.resize((side, side), Image.NEAREST)
+                mask_full         = remove_pad(mask_padded_full, orig_w, orig_h)
+                mask_full.save(f"{session_dir}/candidate_mask_{click_index}_{idx}.png")
+
+                img_np   = self.np.array(original_image, dtype=self.np.float32)
+                mask_np  = (self.np.array(mask_full) > 127)
+                highlight = self.np.array([0, 220, 80], dtype=self.np.float32)
+
+                blended       = img_np.copy()
+                blended[mask_np] = img_np[mask_np] * 0.45 + highlight * 0.55
+                overlay = Image.fromarray(blended.clip(0, 255).astype(self.np.uint8))
+
+                draw = ImageDraw.Draw(overlay)
+                r_outer, r_inner = 14, 10
+
+                for c in clicks:
+                    if c["active"] and c["index"] != click_index:
+                        pcx, pcy = c["cx"], c["cy"]
+                        draw.ellipse([pcx - r_outer, pcy - r_outer, pcx + r_outer, pcy + r_outer],
+                                       fill=(255, 255, 255), outline=(255, 255, 255))
+                        draw.ellipse([pcx - r_inner, pcy - r_inner, pcx + r_inner, pcy + r_inner],
+                                       fill=(220, 30, 30), outline=(220, 30, 30))
+
+                draw.ellipse([cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer],
+                           fill=(255, 255, 255), outline=(255, 255, 255))
+                draw.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner],
+                           fill=(220, 30, 30), outline=(220, 30, 30))
+
+                overlay_url = self._upload_to_cloudinary(
+                    overlay, public_id=f"{session_id}/candidate_overlay_{click_index}_{idx}"
+                )
+                candidates.append({
+                    "candidate_index": idx,
+                    "score": float(scores[idx]),
+                    "overlay_url": overlay_url,
+                })
+
+        volume.commit()
+        print(f"[TIMER] segment_click TOTAL: {time.time() - t0_total:.3f}s")
+        return {"click_index": click_index, "candidates": candidates}
+
+    # ── /segment/choose ───────────────────────────────────────────────────────
+    @modal.method()
+    def segment_choose(self, session_id: str, candidate_index: int, reference_mask: bool, click_index: Optional[int] = None):
+        from PIL import Image
+        import os as _os
+        import json as _json
+
+        t0_total = time.time()
+
+        volume.reload()
+        session_dir = f"/data/{session_id}"
+        if reference_mask:
+            running_mask_path = f"{session_dir}/running_mask_reference.png"
+            clicks_json_path = f"{session_dir}/reference_clicks.json"
+            base_path = f"{session_dir}/base_reference.png"
+        else:
+            running_mask_path = f"{session_dir}/running_mask.png"
+            clicks_json_path = f"{session_dir}/clicks.json"
+            base_path = f"{session_dir}/base.png"
+
+        if not _os.path.exists(clicks_json_path):
+            raise FileNotFoundError(f"No clicks found in session {session_id!r}.")
+
+        with open(clicks_json_path, "r") as f:
+            clicks = _json.load(f)
+
+        if click_index is None:
+            pending_clicks = [c for c in clicks if c.get("candidate_index") is None]
+            if pending_clicks:
+                click_index = pending_clicks[-1]["index"]
+            elif clicks:
+                click_index = clicks[-1]["index"]
+            else:
+                raise ValueError("No clicks found in click history.")
+
+        for c in clicks:
+            if c["index"] == click_index:
+                c["candidate_index"] = candidate_index
+                c["active"] = True
+                break
+        else:
+            raise FileNotFoundError(f"Click index {click_index} not found in click history.")
+
+        with open(clicks_json_path, "w") as f:
+            _json.dump(clicks, f)
+
+        chosen_mask_path = f"{session_dir}/candidate_mask_{click_index}_{candidate_index}.png"
+        if not _os.path.exists(chosen_mask_path):
+            raise FileNotFoundError(
+                f"Candidate mask {candidate_index} for click {click_index} not found. "
+                f"Call /segment/click first."
+            )
+
+        with timed("Recompute combined mask"):
+            base_img = Image.open(base_path).convert("RGB")
+            combined = self._recompute_combined(
+                clicks, session_dir, target_size=(base_img.width, base_img.height)
+            )
+            if combined is None:
+                combined = self.np.zeros((base_img.height, base_img.width), dtype=self.np.uint8)
+            print(f" [choose] active clicks: {self._active_click_indices(clicks)} "
+                  f"| union covers {int(combined.sum())} px")
+
+            Image.fromarray((combined * 255).astype(self.np.uint8)).convert("L").save(
+                running_mask_path
+            )
+
+        with timed("Build running overlay"):
+            img_np   = self.np.array(base_img, dtype=self.np.float32)
+            mask_np  = combined.astype(bool)
+            highlight = self.np.array([0, 220, 80], dtype=self.np.float32)
+            blended  = img_np.copy()
+            blended[mask_np] = img_np[mask_np] * 0.45 + highlight * 0.55
+            running_overlay = Image.fromarray(blended.clip(0, 255).astype(self.np.uint8))
+
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(running_overlay)
+            r_outer, r_inner = 14, 10
+            for c in clicks:
+                if c["active"]:
+                    cx, cy = c["cx"], c["cy"]
+                    draw.ellipse([cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer],
+                               fill=(255, 255, 255), outline=(255, 255, 255))
+                    draw.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner],
+                               fill=(220, 30, 30), outline=(220, 30, 30))
+
+        running_overlay_url = self._upload_to_cloudinary(
+            running_overlay, public_id=f"{session_id}/running_overlay"
+        )
+
+        volume.commit()
+        print(f"[TIMER] segment_choose TOTAL: {time.time() - t0_total:.3f}s")
+        return {
+            "status": "ok",
+            "running_overlay_url": running_overlay_url,
+            "active_indices": [c["index"] for c in clicks if c["active"]]
+        }
+
+    # ── /segment/remove ───────────────────────────────────────────────────────
+    @modal.method()
+    def segment_remove(self, session_id: str, click_indices: List[int], reference_mask: bool):
+        from PIL import Image, ImageDraw
+        import os as _os
+        import json as _json
+
+        t0_total = time.time()
+
+        volume.reload()
+        session_dir = f"/data/{session_id}"
+        if reference_mask:
+            running_mask_path = f"{session_dir}/running_mask_reference.png"
+            clicks_json_path = f"{session_dir}/reference_clicks.json"
+            base_path = f"{session_dir}/base_reference.png"
+        else:
+            running_mask_path = f"{session_dir}/running_mask.png"
+            clicks_json_path = f"{session_dir}/clicks.json"
+            base_path = f"{session_dir}/base.png"
+
+        if not _os.path.exists(clicks_json_path):
+            raise FileNotFoundError("No click records found for this session.")
+
+        with open(clicks_json_path, "r") as f:
+            clicks = _json.load(f)
+
+        applied = self._apply_removals(clicks, click_indices)
+        print(f" [remove] deactivated clicks: {applied} "
+              f"| remaining active: {self._active_click_indices(clicks)}")
+
+        with open(clicks_json_path, "w") as f:
+            _json.dump(clicks, f)
+
+        with timed("Recompute combined mask"):
+            base_img = Image.open(base_path).convert("RGB")
+            combined = self._recompute_combined(
+                clicks, session_dir, target_size=(base_img.width, base_img.height)
+            )
+            if combined is None:
+                combined = self.np.zeros((base_img.height, base_img.width), dtype=self.np.uint8)
+            print(f" [remove] union after removal covers {int(combined.sum())} px")
+
+            Image.fromarray((combined * 255).astype(self.np.uint8)).convert("L").save(
+                running_mask_path
+            )
+
+        with timed("Build running overlay"):
+            img_np   = self.np.array(base_img, dtype=self.np.float32)
+            mask_np  = combined.astype(bool)
+            highlight = self.np.array([0, 220, 80], dtype=self.np.float32)
+            blended  = img_np.copy()
+            blended[mask_np] = img_np[mask_np] * 0.45 + highlight * 0.55
+            running_overlay = Image.fromarray(blended.clip(0, 255).astype(self.np.uint8))
+
+            draw = ImageDraw.Draw(running_overlay)
+            r_outer, r_inner = 14, 10
+            for c in clicks:
+                if c["active"]:
+                    cx, cy = c["cx"], c["cy"]
+                    draw.ellipse([cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer],
+                               fill=(255, 255, 255), outline=(255, 255, 255))
+                    draw.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner],
+                               fill=(220, 30, 30), outline=(220, 30, 30))
+
+        running_overlay_url = self._upload_to_cloudinary(
+            running_overlay, public_id=f"{session_id}/running_overlay"
+        )
+
+        volume.commit()
+        print(f"[TIMER] segment_remove TOTAL: {time.time() - t0_total:.3f}s")
+        return {
+            "status": "ok",
+            "running_overlay_url": running_overlay_url,
+            "active_indices": [c["index"] for c in clicks if c["active"]]
+        }
+
+    # ── /segment/clear ────────────────────────────────────────────────────────
+    @modal.method()
+    def segment_clear(self, session_id: str, reference_mask: bool):
+        import os as _os
+        from PIL import Image
+
+        t0_total = time.time()
+
+        volume.reload()
+        session_dir = f"/data/{session_id}"
+        if reference_mask:
+            running_mask_path = f"{session_dir}/running_mask_reference.png"
+            clicks_json_path = f"{session_dir}/reference_clicks.json"
+            base_path = f"{session_dir}/base_reference.png"
+        else:
+            running_mask_path = f"{session_dir}/running_mask.png"
+            clicks_json_path = f"{session_dir}/clicks.json"
+            base_path = f"{session_dir}/base.png"
+
+        if _os.path.exists(clicks_json_path):
+            try:
+                _os.remove(clicks_json_path)
+            except Exception:
+                pass
+
+        running_overlay_url = None
+        if _os.path.exists(base_path):
+            base_img = Image.open(base_path).convert("RGB")
+            zero_mask = self.np.zeros((base_img.height, base_img.width), dtype=self.np.uint8)
+            Image.fromarray((zero_mask * 255).astype(self.np.uint8)).convert("L").save(
+                running_mask_path
+            )
+            running_overlay_url = self._upload_to_cloudinary(
+                base_img, public_id=f"{session_id}/running_overlay"
+            )
+
+        if _os.path.exists(session_dir):
+            for filename in _os.listdir(session_dir):
+                if filename.startswith("candidate_mask_") or filename.startswith("click_"):
+                    try:
+                        _os.remove(f"{session_dir}/{filename}")
+                    except Exception:
+                        pass
+
+        volume.commit()
+        print(f"[TIMER] segment_clear TOTAL: {time.time() - t0_total:.3f}s")
+        return {
+            "status": "ok",
+            "running_overlay_url": running_overlay_url
+        }
+
+    # ── /segment/extract ──────────────────────────────────────────────────────
+    @modal.method()
+    def extract_from_session(self, req: dict) -> dict:
+        """
+        Extracts the object defined by the running session mask:
+          1. Load base image + running mask from Volume
+          2. Feathered RGBA cutout
+          3. LaMa background fill   (skipped when mode='generate')
+          4. Depth estimation        (skipped when mode='generate')
+          5. Upload outputs to Cloudinary
+          6. Return all URLs + placement_meta + mode
+        """
+        from PIL import Image
+        from scipy.ndimage import binary_dilation
+        import os as _os
+
+        session_id = req["session_id"]
+        mode       = req.get("mode", "move")
+        dilate_px  = int(req.get("dilate_px", 10))
+        feather_px = int(req.get("feather_px", 3))
+
+        volume.reload()
+        session_dir       = f"/data/{session_id}"
+        base_path         = f"{session_dir}/base.png"
+        running_mask_path = f"{session_dir}/running_mask.png"
+
+        if not _os.path.exists(base_path):
+            raise FileNotFoundError("Base image not found — call /segment/click first.")
+        if not _os.path.exists(running_mask_path):
+            raise FileNotFoundError("Running mask not found — call /segment/choose first.")
+
+        image  = Image.open(base_path).convert("RGB")
+        orig_w, orig_h = image.size
+        mask01 = (
+            self.np.array(Image.open(running_mask_path).convert("L")) > 127
+        ).astype(self.np.uint8)
+
+        if mask01.sum() == 0:
+            raise ValueError(
+                "Running mask is empty — no region selected. "
+                "Call /segment/click and /segment/choose first."
+            )
+        print(f"[extract_from_session:{session_id}] mask={mask01.sum()}px  mode={mode!r}")
+
+        # Feathered RGBA cutout (un-dilated mask → precise object boundary)
+        cutout, bbox, centroid = self._extract_cutout(image, mask01, feather_px)
+
+        placement_meta = {
+            "bbox":            {"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+            "centroid":        {"x": centroid[0], "y": centroid[1]},
+            "cutout_size":     {"width": cutout.width,  "height": cutout.height},
+            "background_size": {"width": orig_w,        "height": orig_h},
+        }
+
+        result = {
+            "session_id":     session_id,
+            "mode":           mode,
+            "placement_meta": placement_meta,
+        }
+
+        if mode == "move":
+            # LaMa background fill (dilated mask → no halo)
+            lama_mask = mask01.copy()
+            if dilate_px > 0:
+                lama_mask = binary_dilation(
+                    lama_mask, iterations=dilate_px
+                ).astype(self.np.uint8)
+            lama_mask_pil = Image.fromarray(
+                (lama_mask * 255).astype(self.np.uint8)
+            ).convert("L")
+            clean_bg = self.lama(image, lama_mask_pil)
+
+            # Depth estimation
+            depth_8bit, depth_16bit, _ = self._run_depth(image)
+
+            # Upload all four assets concurrently (pure network I/O — no GPU contention)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                f_cutout = ex.submit(self._upload_to_cloudinary, cutout,
+                                     f"{session_id}/extract_cutout", "PNG")
+                f_bg     = ex.submit(self._upload_to_cloudinary, clean_bg,
+                                     f"{session_id}/extract_clean_bg", "PNG")
+                f_d8     = ex.submit(self._upload_to_cloudinary, depth_8bit,
+                                     f"{session_id}/extract_depth_preview", "PNG")
+                f_d16    = ex.submit(self._upload_to_cloudinary, depth_16bit,
+                                     f"{session_id}/extract_depth_raw16", "PNG")
+            result["cutout_url"]        = f_cutout.result()
+            result["clean_bg_url"]      = f_bg.result()
+            result["depth_preview_url"] = f_d8.result()
+            result["depth_raw16_url"]   = f_d16.result()
+        else:
+            # generate mode: upload cutout only (no LaMa / no depth)
+            result["cutout_url"] = self._upload_to_cloudinary(
+                cutout, f"{session_id}/extract_cutout", "PNG"
+            )
+
+        print(f"[extract_from_session:{session_id}] Done.")
+        return result
+
+    # ── /remove_object ────────────────────────────────────────────────────────
+    @modal.method()
+    def remove_object(self, session_id: str, inpaint_radius: int = 7, dilate_px: int = 3):
+        import os as _os
+        import uuid as _uuid
+        from PIL import Image
+
+        t0_total = time.time()
+
+        volume.reload()
+        session_dir = f"/data/{session_id}"
+        base_path = f"{session_dir}/base.png"
+        running_mask_path = f"{session_dir}/running_mask.png"
+
+        if not _os.path.exists(base_path):
+            raise FileNotFoundError(f"No base image found for session {session_id!r}.")
+        if not _os.path.exists(running_mask_path):
+            raise FileNotFoundError(
+                "Running mask not found — call /segment/click and /segment/choose "
+                "to select the object before calling /remove_object."
+            )
+
+        with timed("Load base image + running mask"):
+            base_img = Image.open(base_path).convert("RGB")
+            mask_img = Image.open(running_mask_path).convert("L")
+            mask_bool = (self.np.array(mask_img) > 127)
+
+        if mask_bool.sum() == 0:
+            raise ValueError(
+                "The running mask is empty — no region was selected. "
+                "Call /segment/click and /segment/choose before /remove_object."
+            )
+
+        result_img = self._lama_fill(
+            base_img, mask_bool, dilate_px=dilate_px, telea_radius=inpaint_radius
+        )
+
+        output_url = self._upload_to_cloudinary(
+            result_img, public_id=f"{session_id}/removed_{_uuid.uuid4().hex}"
+        )
+
+        volume.commit()
+        print(f"[TIMER] remove_object TOTAL: {time.time() - t0_total:.3f}s")
+        return {"status": "ok", "output_url": output_url}
+
+    # ── /generate ─────────────────────────────────────────────────────────────
+    @modal.method()
+    def generate(self, req: dict):
+        from PIL import Image
+        from scipy.ndimage import binary_dilation
+        import os as _os
+        import uuid as _uuid
+
+        # [MEM PATCH] reset the peak tracker at the start of every /generate
+        # call so "peak" below reflects only this request's memory usage,
+        # not whatever accumulated across prior requests on this container.
+        self.torch.cuda.reset_peak_memory_stats()
+        print(f"[generate] VRAM at start: allocated={self.torch.cuda.memory_allocated()/1e9:.2f}GB "
+              f"reserved={self.torch.cuda.memory_reserved()/1e9:.2f}GB")
+
+        t0_total = time.time()
+
+        session_id = req["session_id"]
+        prompt     = req["prompt"]
+        image_url  = req["image_url"]
+        ref_url    = req.get("reference_image_url")
+        steps      = req.get("steps", 14)
+        guidance   = req.get("guidance", 45.0)
+        dilate_px  = req.get("dilate_px", 8)
+        seed       = req.get("seed", 0)
+        match_ref_bbox = req.get("match_ref_bbox", True)
+        diff_cleanup_dilate_px = req.get("diff_cleanup_dilate_px", 3)
+        m1_bbox_expand_px = req.get("m1_bbox_expand_px", 20)
+        sharpen           = req.get("sharpen", True)
+        sharpen_radius    = req.get("sharpen_radius", 2.0)
+        sharpen_percent   = req.get("sharpen_percent", 150)
+        sharpen_threshold = req.get("sharpen_threshold", 2)
+
+        volume.reload()
+        session_dir       = f"/data/{session_id}"
+        running_mask_path = f"{session_dir}/running_mask.png"
+        running_mask_reference_path = f"{session_dir}/running_mask_reference.png"
+        base_path         = f"{session_dir}/base.png"
+
+        if not _os.path.exists(running_mask_path):
+            raise FileNotFoundError("Running mask not found — call /segment/choose first.")
+
+        with timed("Load/download target image"):
+            if image_url:
+                try:
+                    init_image = self._download_image(image_url)
+                except Exception as e:
+                    if _os.path.exists(base_path):
+                        print(
+                            f"[generate] WARNING: failed to download image_url={image_url!r} "
+                            f"({e}); falling back to the cached base image for this session."
+                        )
+                        init_image = Image.open(base_path).convert("RGB")
+                    else:
+                        raise
+            elif _os.path.exists(base_path):
+                init_image = Image.open(base_path).convert("RGB")
+            else:
+                raise ValueError(
+                    "No image_url provided and no cached base image found for this session."
+                )
+
+        orig_w, orig_h = init_image.size
+        side = max(orig_w, orig_h)
+
+        with timed("Load + align running mask"):
+            mask_image_raw  = Image.open(running_mask_path).convert("L")
+            if mask_image_raw.size != (orig_w, orig_h):
+                print(
+                    f"[generate] WARNING: running mask size {mask_image_raw.size} does not "
+                    f"match fetched image_url size {(orig_w, orig_h)} — resizing mask to "
+                    f"match. If this isn't expected, double-check image_url points to the "
+                    f"same photo the mask was drawn on."
+                )
+                mask_image_raw = mask_image_raw.resize((orig_w, orig_h), Image.NEAREST)
+
+        reference_image = self._download_image(ref_url) if ref_url else None
+
+        if ref_url:
+            if not _os.path.exists(running_mask_reference_path):
+                raise FileNotFoundError(
+                    "Reference running mask not found — call /segment/click and "
+                    "/segment/choose with reference_mask=true on the reference image first."
+                )
+            mask_image_reference = Image.open(running_mask_reference_path).convert("L")
+        else:
+            mask_image_reference = None
+
+        TILE = int(req.get("tile_size", 768))
+        FILL_SIZE = int(req.get("fill_size", 1024))
+
+        generator = self.torch.Generator(device="cuda").manual_seed(seed)
+        use_teacache    = req.get("teacache", True)
+        teacache_thresh = req.get("teacache_thresh", REL_L1_THRESH)
+
+        debug_urls = {}
+
+        original_forward = None
+        if use_teacache:
+            with timed("Apply TeaCache patch"):
+                original_forward = apply_teacache(
+                    self.pipe, num_steps=steps, rel_l1_thresh=teacache_thresh
+                )
+            print(f"[generate] TeaCache enabled (thresh={teacache_thresh})")
+
+        try:
+            if reference_image is not None:
+                with timed("Prepare tiles (target/mask/ref pad+resize)"):
+                    target_tile = self._pad_and_resize_square(init_image, TILE)
+                    mask_tile   = self._pad_and_resize_square(mask_image_raw, TILE)
+                    ref_tile    = self._pad_and_resize_square(reference_image, TILE)
+                    ref_mask_tile = self._pad_and_resize_square(mask_image_reference, TILE)
+
+                    mask01 = (self.np.array(mask_tile) > 127).astype(self.np.uint8)
+                    if mask01.sum() == 0:
+                        raise ValueError(
+                            "The running mask is empty — no region was selected. "
+                            "Call /segment/click and /segment/choose before /generate."
+                        )
+
+                    m1 = mask01.copy()
+
+                with timed("Match mask to reference bbox"):
+                    m2 = None
+                    ref_bbox_wh = None
+                    mask_bbox_wh = None
+                    if match_ref_bbox:
+                        ref_bbox = self._get_object_bbox_scaled(ref_mask_tile, canvas_size=TILE)
+                        rx0, ry0, rx1, ry1 = ref_bbox
+                        ref_area_frac = ((rx1 - rx0) * (ry1 - ry0)) / float(TILE * TILE)
+                        ref_touches_all_edges = (
+                            rx0 <= 1 and ry0 <= 1 and rx1 >= TILE - 1 and ry1 >= TILE - 1
+                        )
+                        bbox_reliable = (ref_area_frac <= 0.75) and (not ref_touches_all_edges)
+
+                        if bbox_reliable:
+                            mask01, mask_bbox_wh, ref_bbox_wh = self._match_mask_to_ref_bbox(
+                                mask01, ref_bbox, canvas_size=TILE
+                            )
+                            m2 = mask01.copy()
+                        else:
+                            print(
+                                f"[generate] WARNING: reference bbox looks unreliable "
+                                f"(covers {ref_area_frac*100:.0f}% of the tile, "
+                                f"touches_all_edges={ref_touches_all_edges}). This usually means "
+                                f"the reference image is a full room/lifestyle photo rather than a "
+                                f"clean cutout on a white background. Skipping match_ref_bbox for "
+                                f"this generation and using the originally selected mask as-is."
+                            )
+                            m2 = mask01.copy()
+                            mask_bbox_wh = None
+                            ref_bbox_wh = None
+
+                        print(f"[generate] mask bbox (w,h) BEFORE match: {mask_bbox_wh} px "
+                              f"| reference object bbox (w,h) [measured on raw ref, scaled to {TILE}px]: {ref_bbox_wh} px")
+                        if mask01.sum() == 0:
+                            raise ValueError(
+                                "Mask became empty after matching to the reference bbox — "
+                                "check that the reference image actually has a clear subject "
+                                "on a light background, or set match_ref_bbox=false."
+                            )
+
+                with timed("Expand m1 mask directly (no bbox)"):
+                    m1_bool = m1.astype(bool)
+                    if m1_bbox_expand_px > 0 and m1_bool.any():
+                        m1_rect = binary_dilation(m1_bool, iterations=m1_bbox_expand_px)
+                    else:
+                        m1_rect = m1_bool
+                    print(f"[generate] m1 mask px count: {int(m1_bool.sum())} "
+                          f"| expanded by {m1_bbox_expand_px}px (dilation) -> "
+                          f"{int(m1_rect.sum())} px")
+
+                target_tile = self._lama_fill(
+                    target_tile, m1_rect, dilate_px=diff_cleanup_dilate_px
+                )
+
+                if dilate_px > 0:
+                    mask01 = binary_dilation(mask01, iterations=dilate_px).astype(self.np.uint8)
+                mask_tile = Image.fromarray((mask01 * 255).astype(self.np.uint8)).convert("L")
+
+                with timed("Build stitched canvas (no padding)"):
+                    canvas_img, canvas_mask_img, (canvas_w, canvas_h) = (
+                        self._build_stitched_canvas(target_tile, mask_tile, ref_tile, TILE)
+                    )
+
+                debug_urls["debug_canvas_image_url"] = self._upload_to_cloudinary(
+                    canvas_img, public_id=f"{session_id}/debug_canvas_image_{_uuid.uuid4().hex}"
+                )
+                debug_urls["debug_canvas_mask_url"] = self._upload_to_cloudinary(
+                    canvas_mask_img, public_id=f"{session_id}/debug_canvas_mask_{_uuid.uuid4().hex}"
+                )
+
+                print(f"[generate] fused tiles: {TILE}x{TILE} each -> concatenated canvas "
+                      f"{canvas_w}x{canvas_h} (no padding applied)")
+
+                with self.torch.inference_mode():
+                    with timed("FLUX.1-Redux prior encode"):
+                        redux_out = self.pipe.prior_redux(
+                            image=ref_tile, prompt=prompt, prompt_2=prompt
+                        )
+                prompt_embeds        = redux_out.prompt_embeds.to("cuda", dtype=self.torch.bfloat16)
+                pooled_prompt_embeds = redux_out.pooled_prompt_embeds.to("cuda", dtype=self.torch.bfloat16)
+
+                with self.torch.inference_mode():
+                    gen_output_canvas = self._call_pipe_safe(
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        image=canvas_img,
+                        mask_image=canvas_mask_img,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance,
+                        height=canvas_img.height,
+                        width=canvas_img.width,
+                        generator=generator,
+                    ).images[0]
+
+                debug_urls["debug_output_canvas_url"] = self._upload_to_cloudinary(
+                    gen_output_canvas, public_id=f"{session_id}/debug_output_canvas_{_uuid.uuid4().hex}"
+                )
+
+                with timed("Crop target half out of generated canvas"):
+                    gen_output = gen_output_canvas.crop((TILE, 0, canvas_w, canvas_h))
+
+            else:
+                with timed("Prepare image + mask for plain text-prompt fill"):
+                    gen_image    = self._pad_and_resize_square(init_image, FILL_SIZE)
+                    gen_mask_img = self._pad_and_resize_square(mask_image_raw, FILL_SIZE)
+
+                    mask01 = (self.np.array(gen_mask_img) > 127).astype(self.np.uint8)
+                    if mask01.sum() == 0:
+                        raise ValueError(
+                            "The running mask is empty — no region was selected. "
+                            "Call /segment/click and /segment/choose before /generate."
+                        )
+                    if dilate_px > 0:
+                        mask01 = binary_dilation(mask01, iterations=dilate_px).astype(self.np.uint8)
+                    gen_mask = Image.fromarray((mask01 * 255).astype(self.np.uint8)).convert("L")
+
+                debug_urls["debug_canvas_image_url"] = self._upload_to_cloudinary(
+                    gen_image, public_id=f"{session_id}/debug_canvas_image_{_uuid.uuid4().hex}"
+                )
+                debug_urls["debug_canvas_mask_url"] = self._upload_to_cloudinary(
+                    gen_mask, public_id=f"{session_id}/debug_canvas_mask_{_uuid.uuid4().hex}"
+                )
+
+                with self.torch.inference_mode():
+                    gen_output = self._call_pipe_safe(
+                        prompt=prompt,
+                        prompt_2=prompt,
+                        image=gen_image,
+                        mask_image=gen_mask,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance,
+                        height=FILL_SIZE,
+                        width=FILL_SIZE,
+                        generator=generator,
+                    ).images[0]
+
+                debug_urls["debug_output_canvas_url"] = self._upload_to_cloudinary(
+                    gen_output, public_id=f"{session_id}/debug_output_canvas_{_uuid.uuid4().hex}"
+                )
+
+                with timed("Composite generated output onto original"):
+                    gen_output = Image.composite(gen_output, gen_image, gen_mask)
+        finally:
+            if use_teacache and original_forward is not None:
+                remove_teacache(self.pipe, original_forward)
+
+        with timed("Progressive upscale to original resolution"):
+            square_output = self._progressive_upscale(gen_output, side, side)
+
+        with timed("Remove pad to original aspect ratio"):
+            final_output = remove_pad(square_output, orig_w, orig_h)
+
+        if sharpen:
+            with timed("Sharpen output"):
+                final_output = self._sharpen(
+                    final_output,
+                    radius=sharpen_radius,
+                    percent=sharpen_percent,
+                    threshold=sharpen_threshold,
+                )
+
+        output_url = self._upload_to_cloudinary(
+            final_output, public_id=f"{session_id}/output_{_uuid.uuid4().hex}"
+        )
+        result = {"output_url": output_url}
+        result.update(debug_urls)
+
+        # [MEM PATCH] the number you actually asked about: peak VRAM reached
+        # anywhere during this /generate call (SAM2/LaMa/Redux/diffusion all
+        # included), plus end-of-request resting allocated/reserved values.
+        print(f"[generate] VRAM at end: allocated={self.torch.cuda.memory_allocated()/1e9:.2f}GB "
+              f"reserved={self.torch.cuda.memory_reserved()/1e9:.2f}GB "
+              f"PEAK during generate={self.torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+        print(f"[TIMER] generate TOTAL: {time.time() - t0_total:.3f}s")
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton — avoids constructing a new Modal handle per request.
+# The GPU container is kept warm by scaledown_window; the handle is cheap to reuse.
+# ---------------------------------------------------------------------------
+_pipeline = CombinedPipeline()
+
+@app.function(
+    image=container_image,
+    secrets=ALL_SECRETS,
+    # Match the GPU cls timeout so HTTP requests survive a full cold start
+    # without hitting the default 300s queue timeout (confirmed bug: 2026-07-20)
+    timeout=600,
+)
+@modal.asgi_app()
+def fastapi_app():
+    web_app = FastAPI(title="FLUX-Fill & SAM2 Pipeline", version="3.6.0")
+
+    @web_app.post("/segment/click")
+    def segment_click_endpoint(payload: ClickRequest):
+        session_id = payload.session_id or uuid.uuid4().hex
+        try:
+            res = _pipeline.segment_click.remote(
+                session_id, payload.image_url, payload.cx, payload.cy, payload.max_dim, payload.reference_mask
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return {
+            "session_id": session_id,
+            "click_index": res["click_index"],
+            "candidates": res["candidates"]
+        }
+
+    @web_app.post("/segment/choose")
+    def segment_choose_endpoint(payload: ChooseRequest):
+        try:
+            result = _pipeline.segment_choose.remote(
+                payload.session_id, payload.candidate_index, payload.reference_mask, payload.click_index
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return result
+
+    @web_app.post("/segment/remove")
+    def segment_remove_endpoint(payload: RemoveRequest):
+        try:
+            result = _pipeline.segment_remove.remote(
+                payload.session_id, payload.click_indices, payload.reference_mask
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return result
+
+    @web_app.post("/segment/clear")
+    def segment_clear_endpoint(payload: ClearRequest):
+        try:
+            result = _pipeline.segment_clear.remote(
+                payload.session_id, payload.reference_mask
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return result
+
+    @web_app.post("/segment/extract")
+    def segment_extract_endpoint(payload: ExtractFromSessionRequest):
+        """
+        Extract the selected object from a segment session.
+        - mode='move'     → RGBA cutout + LaMa clean background + 8/16-bit depth maps
+        - mode='generate' → RGBA cutout only (use /generate for inpainting)
+        """
+        try:
+            result = _pipeline.extract_from_session.remote(payload.model_dump())
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return result
+
+    @web_app.post("/remove_object")
+    def remove_object_endpoint(payload: RemoveObjectRequest):
+        try:
+            result = _pipeline.remove_object.remote(
+                payload.session_id, payload.inpaint_radius, payload.dilate_px
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return result
+
+    @web_app.post("/generate")
+    def generate_endpoint(payload: GenerateRequest):
+        try:
+            result = _pipeline.generate.remote(payload.model_dump())
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return result
+
+    return web_app
