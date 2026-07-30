@@ -2,8 +2,13 @@
 https://github.com/Prathamesh-Hingol/IITISOC-InteriorAI-Studio
 
 # Interior AI Studio — Intelligent Interior Design Platform Interior design decisions are expensive to get wrong. Picking the wrong paint colour, furniture piece, or layout usually means rework, wasted money, and a room that still doesn’t look right. Professional design consultation is out of reach for most people, and a mood board on paper doesn’t show how a change will actually look in someone’s real space. Virtual try-on is very helpful in such cases.Interior AI Studio is built around three modules providing a variety of options to users:
+
 A — Image-Based Interior Editing. A user uploads an image of their interior and describes the change in plain language (e.g. “change the bedsheet and pillows to navy blue”). The model applies the edit based on the prompt given while keeping the rest of the room untouched. This is the module our FLUX.1-Kontext optimisation work  directly supports.
+
 B — Text-to-Interior Generation. When the user has no existing interior image, this module allows them to generate a photorealistic interior concept from a text description alone, which can then be passed into Module A for further editing.
+
 C — Furniture Inpainting. Given an interior image and an image of a furniture piece to be inserted in place of an existing item, this module detects and masks the existing item, then composites the new piece in —matching perspective, lighting, scale, and shadow.
+
 D — Drag-and-Drop Object Repositioning. The user selects an object in the interior image; the module segments and extracts it, then inpaints the vacated area. The user drags the object to a new position, and a depth-analysis pass automatically rescales it to match its new depth in the scene (closer = larger, further = smaller), keeping perspective and shadows consistent.
+
 E — 3D View Synthesis. Using the same depth analysis, this module builds an approximate 3D view of the room from the 2D image, letting the user to see the space from angles beyond the original photo.
