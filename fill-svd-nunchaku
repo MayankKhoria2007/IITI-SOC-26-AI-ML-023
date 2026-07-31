@@ -1,0 +1,285 @@
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import gc
+import io
+import time
+import argparse
+import warnings
+import urllib.request
+
+import numpy as np
+import torch
+from PIL import Image
+from scipy.ndimage import binary_dilation
+from huggingface_hub import login
+
+from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
+from nunchaku import NunchakuFluxTransformer2dModel
+from nunchaku.utils import get_precision
+
+warnings.filterwarnings("ignore")
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
+if not HF_TOKEN:
+    HF_TOKEN = input("Hugging Face token (or set HF_TOKEN env var next time): ").strip()
+login(token=HF_TOKEN)
+
+FLUX_MODEL = "black-forest-labs/FLUX.1-Fill-dev"
+GUIDANCE = 45.0
+SEED = 0
+
+SESSIONS_ROOT = "sessions"
+
+
+def get_session_dir(session_id, sessions_root=SESSIONS_ROOT):
+    return os.path.join(sessions_root, session_id)
+
+
+def load_session(session_id, sessions_root=SESSIONS_ROOT):
+    session_dir = get_session_dir(session_id, sessions_root)
+    image_path = os.path.join(session_dir, "original.png")
+    mask_path = os.path.join(session_dir, "mask.png")
+
+    if not os.path.isdir(session_dir):
+        raise FileNotFoundError(f"Session '{session_id}' not found at: {session_dir}")
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"Session '{session_id}' has no original image at: {image_path}")
+    if not os.path.isfile(mask_path):
+        raise FileNotFoundError(f"Session '{session_id}' has no mask at: {mask_path}")
+
+    print(f"[*] Loaded session '{session_id}' -> image: {image_path}, mask: {mask_path}")
+    return session_dir, image_path, mask_path
+
+
+def load_image(source):
+    if source.startswith("http://") or source.startswith("https://"):
+        print(f"[*] Downloading image from URL: {source}")
+        req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+    else:
+        print(f"[*] Loading image from local path: {source}")
+        image = Image.open(source).convert("RGB")
+    return image
+
+
+def load_mask(source):
+    if source.startswith("http://") or source.startswith("https://"):
+        print(f"[*] Downloading mask from URL: {source}")
+        req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+        mask_img = Image.open(io.BytesIO(data)).convert("L")
+    else:
+        print(f"[*] Loading mask from local path: {source}")
+        mask_img = Image.open(source).convert("L")
+    mask01 = (np.array(mask_img) > 127).astype(np.uint8)
+    return mask01
+
+
+def load_flux_pipeline(model_name=FLUX_MODEL):
+    transformer_load_start = time.perf_counter()
+    print("[*] Loading transformer with Nunchaku int4/fp4 quantization...")
+    precision = get_precision()
+    transformer = NunchakuFluxTransformer2dModel.from_pretrained(
+        f"nunchaku-tech/nunchaku-flux.1-fill-dev/svdq-{precision}_r32-flux.1-fill-dev.safetensors"
+    )
+    transformer_load_time = time.perf_counter() - transformer_load_start
+    print(f"Transformer load time: {transformer_load_time:.2f} seconds")
+
+    pipe_load_start = time.perf_counter()
+    pipe = FluxFillPipeline.from_pretrained(
+        model_name,
+        transformer=transformer,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    pipe_load_time = time.perf_counter() - pipe_load_start
+    print(f"Pipeline load time:    {pipe_load_time:.2f} seconds")
+    print(f"Total model load time: {transformer_load_time + pipe_load_time:.2f} seconds")
+
+    free_gb = torch.cuda.mem_get_info()[0] / (1024 ** 3)
+    print(f" Free GPU memory before placement: {free_gb:.2f} GB")
+
+    pipe.to("cuda")
+    pipe.enable_vae_slicing()
+    pipe.enable_vae_tiling()
+
+    print("  Loading FLUX.1 Redux prior pipeline -> cuda...")
+    t_redux = time.perf_counter()
+    pipe.prior_redux = FluxPriorReduxPipeline.from_pretrained(
+        "black-forest-labs/FLUX.1-Redux-dev",
+        torch_dtype=torch.bfloat16,
+        text_encoder=pipe.text_encoder,
+        text_encoder_2=pipe.text_encoder_2,
+        tokenizer=pipe.tokenizer,
+        tokenizer_2=pipe.tokenizer_2,
+    ).to("cuda")
+    print(f"  Redux load time: {time.perf_counter()-t_redux:.1f}s")
+
+    return pipe
+
+
+def encode_prompt_and_free_encoders(pipe, prompt, reference_image):
+    resized = reference_image.resize((1024, 1024), Image.LANCZOS)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        redux_out = pipe.prior_redux(image=resized, prompt=prompt)
+    prompt_embeds = redux_out.prompt_embeds.to("cuda", dtype=torch.bfloat16)
+    pooled_prompt_embeds = redux_out.pooled_prompt_embeds.to("cuda", dtype=torch.bfloat16)
+    print(f"  [redux] encode time: {time.perf_counter()-t0:.2f}s")
+    gc.collect()
+    torch.cuda.empty_cache()
+    return prompt_embeds, pooled_prompt_embeds
+
+
+def run_flux_fill_with_metrics(pipe, image, mask01, prompt_embeds, pooled_prompt_embeds,
+                                steps=14, guidance=GUIDANCE, dilate_px=6, seed=SEED,
+                                debug_mask_path="debug_mask.png"):
+    if dilate_px > 0:
+        mask01 = binary_dilation(mask01, iterations=dilate_px).astype(np.uint8)
+
+    mask_image = Image.fromarray((mask01 * 255).astype(np.uint8)).convert("L")
+    mask_image.save(debug_mask_path)
+    nonzero = (np.array(mask_image) > 0).sum()
+    total = mask01.size
+    print(f" mask_image mode={mask_image.mode}, size={mask_image.size}, "
+          f"nonzero_pixels={nonzero} ({100 * nonzero / total:.1f}%)")
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    with torch.inference_mode():
+        final_output = pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            image=image,
+            mask_image=mask_image,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            height=1024,
+            width=1024,
+            generator=generator,
+        ).images[0]
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+
+    latency = end_time - start_time
+    peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+    print("\n" + "=" * 50)
+    print("             INFERENCE COMPLETION METRICS")
+    print("=" * 50)
+    print(f" Steps: {steps}  Guidance: {guidance}")
+    print(f" Image size: 1024x1024")
+    print(f" Total Generation Time: {latency:.2f} seconds")
+    print(f" Peak VRAM Utilized:    {peak_vram:.2f} GB")
+    print("=" * 50)
+
+    a = np.array(image.resize(final_output.size)).astype(np.int16)
+    b = np.array(final_output).astype(np.int16)
+    diff = np.abs(a - b)
+    mbool = mask01.astype(bool)
+    if b.shape[:2] == mbool.shape:
+        print(f" mean pixel diff INSIDE mask:  {diff[mbool].mean():.2f}")
+        print(f" mean pixel diff OUTSIDE mask: {diff[~mbool].mean():.2f}")
+
+    return final_output
+
+
+def unload_flux(pipe):
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def generate_image(session_id, prompt, reference_image_source,
+                    steps=14, guidance=GUIDANCE, dilate_px=6, seed=SEED,
+                    sessions_root=SESSIONS_ROOT, output_path=None):
+    session_dir, image_path, mask_path = load_session(session_id, sessions_root)
+
+    init_image = load_image(image_path)
+    mask01 = load_mask(mask_path)
+    reference_image = load_image(reference_image_source)
+
+    if mask01.shape[:2] != (init_image.size[1], init_image.size[0]):
+        print(f" [WARNING] mask size {mask01.shape[:2]} != image size "
+              f"{(init_image.size[1], init_image.size[0])}. Resizing mask to match image.")
+        mask_img = Image.fromarray((mask01 * 255).astype(np.uint8)).resize(
+            init_image.size, Image.NEAREST
+        )
+        mask01 = (np.array(mask_img) > 127).astype(np.uint8)
+
+    if output_path is None:
+        output_path = os.path.join(session_dir, "output.png")
+    debug_mask_path = os.path.join(session_dir, "debug_mask.png")
+
+    pipe = load_flux_pipeline(FLUX_MODEL)
+    prompt_embeds, pooled_prompt_embeds = encode_prompt_and_free_encoders(
+        pipe, prompt, reference_image,
+    )
+
+    final_output = run_flux_fill_with_metrics(
+        pipe, init_image, mask01,
+        prompt_embeds, pooled_prompt_embeds,
+        steps=steps, guidance=guidance, dilate_px=dilate_px, seed=seed,
+        debug_mask_path=debug_mask_path,
+    )
+
+    unload_flux(pipe)
+
+    final_output.save(output_path)
+    print(f"\n[SUCCESS] Image successfully processed and saved to: {output_path}")
+    return final_output
+
+
+def run_inputs():
+    parser = argparse.ArgumentParser(description="FLUX.1-Fill generation service")
+    parser.add_argument("--session-id", default=None,
+                         help="Session id created by the segmentation script; used to load "
+                              "the original image and mask.")
+    parser.add_argument("--sessions-dir", default=SESSIONS_ROOT,
+                         help="Root directory where session folders are stored.")
+    parser.add_argument("--prompt", default=None, help="Edit prompt")
+    parser.add_argument("--reference-image", default=None,
+                         help="Path or URL of the reference image used for the Redux prior")
+    parser.add_argument("--steps", type=int, default=14)
+    parser.add_argument("--guidance", type=float, default=GUIDANCE)
+    parser.add_argument("--dilate-px", type=int, default=6)
+    parser.add_argument("--output", default=None,
+                         help="Optional output path. Defaults to output.png inside the session dir.")
+    args, _ = parser.parse_known_args()
+
+    while not args.session_id:
+        args.session_id = input("Session id: ").strip()
+    while not args.prompt:
+        args.prompt = input("Edit prompt: ").strip()
+    while not args.reference_image:
+        args.reference_image = input("Reference image path or URL (for Redux prior): ").strip()
+
+    return args
+
+
+if __name__ == "__main__":
+    args = run_inputs()
+
+    generate_image(
+        session_id=args.session_id,
+        prompt=args.prompt,
+        reference_image_source=args.reference_image,
+        steps=args.steps,
+        guidance=args.guidance,
+        dilate_px=args.dilate_px,
+        seed=SEED,
+        sessions_root=args.sessions_dir,
+        output_path=args.output,
+    )
