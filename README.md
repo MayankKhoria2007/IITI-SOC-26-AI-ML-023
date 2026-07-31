@@ -37,7 +37,6 @@ Core modules of the product:
 ├── Schnell-TorchAO/    Readme.md, main.py, output.jpg
 ├── fill-redux-nf4-teacache-compile/   Readme.md, main.py, bed.jpg, bed1.jpg, initial.jpg, output.jpg, output1.jpg
 ├── kontext_simple_nf4/ Readme.md, nf4_kontext.py, nf4_kontext.png
-├── modal.py                # Kontext production service (Cloudinary + TeaCache, bnb NF4)
 ├── Kontext-final           # Kontext production service v2 (Nunchaku SVDQuant INT4, TeaCache)
 ├── Schnell-final           # Schnell + LoRA production service (Modal, FastAPI)
 ├── schnell_finetuning.py   # LoRA fine-tuning trainer for FLUX.1-Schnell on Modal
@@ -76,7 +75,6 @@ Each folder below is a self-contained benchmark of one model + one optimization 
 
 | File | Purpose | Model(s) | Optimizations |
 |---|---|---|---|
-| **modal.py** | Production Kontext image-editing service (`flux-kontext-cloudinary-teacache-service`), FastAPI + Cloudinary upload | FLUX.1-Kontext-dev | BitsAndBytes NF4 (transformer + T5) + **TeaCache** patched forward pass + block-level `torch.compile` + PIL output enhancement |
 | **Kontext-final** | Newer Kontext production service, same app name, upgraded backend | FLUX.1-Kontext-dev | **Nunchaku SVDQuant INT4** transformer (replaces bnb NF4) + TeaCache + dimension snapping for FLUX-friendly resolutions; GPU snapshotting disabled (Nunchaku INT4 kernels crash on restore) |
 | **Schnell-final** | Production text-to-interior service (`flux-schnell-lora`) with LoRA support and Cloudinary output | FLUX.1-Schnell + custom LoRA adapter | Modal `@app.cls` with persistent HF/LoRA volumes, FastAPI endpoint, fixed 4-step distilled sampling |
 | **schnell_finetuning.py** | LoRA fine-tuning trainer for Schnell on an interior-design dataset (`victorzarzu/interior-design-prompt-editing-dataset-test`) | FLUX.1-Schnell | Runs on Modal GPU; custom `Dataset`/`DataLoader`, mock embedding path for AOT-style training loop, gradient checkpointing imports |
