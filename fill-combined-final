@@ -927,7 +927,7 @@ class CombinedPipeline:
         patch = arr[y0:y1, x0:x1]
         return patch.reshape(-1, arr.shape[-1]).mean(axis=0)
 
-    def _build_stitched_canvas(self, target_tile, mask_tile, ref_tile, half):
+    def _build_stitched_canvas(self, target_tile, mask_tile, ref_tile, half):#Conactenation of base image and reference image
         canvas_w, canvas_h = half * 2, half
 
         canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
