@@ -37,7 +37,7 @@ Core modules of the product:
 ├── Schnell-TorchAO/    Readme.md, main.py, output.jpg
 ├── fill-redux-nf4-teacache-compile/   Readme.md, main.py, bed.jpg, bed1.jpg, initial.jpg, output.jpg, output1.jpg
 ├── kontext_simple_nf4/ Readme.md, nf4_kontext.py, nf4_kontext.png
-├── Kontext-final           # Kontext production service v2 (Nunchaku SVDQuant INT4, TeaCache)
+├── Kontext-final-svd-nunchaku-Teacache   # Kontext production service v2 (Nunchaku SVDQuant INT4, TeaCache)
 ├── Schnell-final           # Schnell + LoRA production service (Modal, FastAPI)
 ├── schnell_finetuning.py   # LoRA fine-tuning trainer for FLUX.1-Schnell on Modal
 ├── prompt-enhance-final    # Qwen2.5-7B prompt-safety/enhancement microservice (vLLM on Modal)
@@ -45,6 +45,7 @@ Core modules of the product:
 ├── drag-drop -final        # Segment → move → depth-rescale → inpaint pipeline (SAM2 + LaMa + Depth-Anything + FLUX.1-Fill)
 ├── fill-combined-final     # All-in-one Modal service: SAM2 + T5(NF4) + Nunchaku FLUX.1-Fill + Redux + Depth-Anything + TeaCache
 └── teacache.py             # Standalone FLUX.1-Kontext + TeaCache reference script
+└── fill-svd-nunchaku       # FLUX Fill with SVD INT4 + Nunchaku(not the final configuration for flux-fill final(present in fill-combined-final))
 ```
 
 ---
@@ -75,7 +76,7 @@ Each folder below is a self-contained benchmark of one model + one optimization 
 
 | File | Purpose | Model(s) | Optimizations |
 |---|---|---|---|
-| **Kontext-final** | Newer Kontext production service, same app name, upgraded backend | FLUX.1-Kontext-dev | **Nunchaku SVDQuant INT4** transformer (replaces bnb NF4) + TeaCache + dimension snapping for FLUX-friendly resolutions; GPU snapshotting disabled (Nunchaku INT4 kernels crash on restore) |
+| **Kontext-final-svd-nunchaku-Teacache** | Newer Kontext production service, same app name, upgraded backend | FLUX.1-Kontext-dev | **Nunchaku SVDQuant INT4** transformer (replaces bnb NF4) + TeaCache + dimension snapping for FLUX-friendly resolutions; GPU snapshotting disabled (Nunchaku INT4 kernels crash on restore) |
 | **Schnell-final** | Production text-to-interior service (`flux-schnell-lora`) with LoRA support and Cloudinary output | FLUX.1-Schnell + custom LoRA adapter | Modal `@app.cls` with persistent HF/LoRA volumes, FastAPI endpoint, fixed 4-step distilled sampling |
 | **schnell_finetuning.py** | LoRA fine-tuning trainer for Schnell on an interior-design dataset (`victorzarzu/interior-design-prompt-editing-dataset-test`) | FLUX.1-Schnell | Runs on Modal GPU; custom `Dataset`/`DataLoader`, mock embedding path for AOT-style training loop, gradient checkpointing imports |
 | **prompt-enhance-final** | Prompt safety filter + prompt-quality enhancer microservice | Qwen2.5-7B-Instruct-AWQ | Served via **vLLM** on Modal; AWQ-quantized LLM; separate system prompts for Schnell (generation) vs. Fill (inpainting) tasks; returns `SAFE|||<prompt>` / `UNSAFE` |
@@ -83,6 +84,7 @@ Each folder below is a self-contained benchmark of one model + one optimization 
 | **drag-drop -final** | Full drag-and-drop object repositioning pipeline: segment → cut out → inpaint background → depth-rescale → recomposite | SAM2 + LaMa (background fill) + Depth-Anything-V2-Small + FLUX.1-Fill-dev | TorchAO-quantized FLUX.1-Fill, depth-based auto-rescaling on reposition, mem-efficient SDP |
 | **fill-combined-final** | All-in-one Modal microservice (`herin_final`) exposing segmentation + inpainting + object-move as REST endpoints | SAM2 + T5-XXL (NF4) + **Nunchaku INT4/FP4 FLUX.1-Fill** + FLUX.1-Redux prior + Depth-Anything-V2-Small | NF4 T5 (9.4GB→2.4GB), Nunchaku quantized transformer, **TeaCache**, square-padding helpers for non-square inputs, per-endpoint FastAPI routes for click/choose/remove/generate/extract |
 | **teacache.py** | Standalone reference implementation of the **TeaCache** step-skipping patch for FLUX.1-Kontext | FLUX.1-Kontext-dev | BitsAndBytes NF4, TeaCache (polynomial-fitted rel-L1 skip threshold), deterministic CUDA config, PIL output sharpening |
+| **fill-svd-nunchaku** | FLUX Fill with SVD INT4 + Nunchaku(not the final configuration for flux-fill final(present in fill-combined-final))|
 
 ---
 
