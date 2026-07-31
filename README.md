@@ -1,4 +1,4 @@
-# Interior AI Studio — Model & Inference Optimization Lab
+# Interior AI Studio — Model & Inference Optimization
 
 **Intelligent Interior Design Platform — see the change before you make it.**
 
